@@ -325,15 +325,12 @@ class NeuronCorrelationComputer:
         
         # Check dataset structure and handle accordingly
         if hasattr(tokenized_dataset, 'column_names') and 'tokens' in tokenized_dataset.column_names:
-            # Dataset has 'tokens' column
             dataset_to_use = tokenized_dataset['tokens']
         else:
-            # Dataset is directly the tokens
             dataset_to_use = tokenized_dataset
         
-        # Convert tokens to tensor format for DataLoader
+        # Simple collate function to handle variable lengths
         def collate_fn(batch):
-            # Handle different batch formats
             if isinstance(batch[0], list):
                 sequences = batch
             elif isinstance(batch[0], dict) and 'tokens' in batch[0]:
@@ -350,7 +347,7 @@ class NeuronCorrelationComputer:
             dataset_to_use, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
         )
         
-        # Initialize correlation computation
+        # Initialize correlation computation - keep everything on CPU to avoid memory issues
         m1_sum = torch.zeros(model1.cfg.n_layers, model1.cfg.d_mlp, dtype=torch.float64)
         m1_sum_sq = torch.zeros(model1.cfg.n_layers, model1.cfg.d_mlp, dtype=torch.float64)
         m2_sum = torch.zeros(model2.cfg.n_layers, model2.cfg.d_mlp, dtype=torch.float64) 
@@ -368,7 +365,7 @@ class NeuronCorrelationComputer:
             # Send batch to first model's device
             batch = batch.to(device1)
             
-            # Get activations
+            # Get activations from first model
             acts1 = self.get_activations(model1, batch)  # [l1, d1, t]
             
             # Send batch to second model's device if different
@@ -376,26 +373,28 @@ class NeuronCorrelationComputer:
                 batch = batch.to(device2)
             acts2 = self.get_activations(model2, batch)  # [l2, d2, t]
             
-            # Filter padding tokens
+            # Filter padding tokens - use the batch from device1 for consistency
             valid_mask = (batch.flatten() != 0)
-            acts1 = acts1[:, :, valid_mask]
-            acts2 = acts2[:, :, valid_mask]
             
-            n_tokens = acts1.shape[-1]
+            # Move activations to CPU and filter
+            acts1_cpu = acts1.cpu()[:, :, valid_mask.cpu()]
+            acts2_cpu = acts2.cpu()[:, :, valid_mask.cpu()]
+            
+            n_tokens = acts1_cpu.shape[-1]
             n_samples += n_tokens
             
-            # Update correlation statistics
-            m1_sum += acts1.sum(dim=-1)
-            m1_sum_sq += (acts1**2).sum(dim=-1)
-            m2_sum += acts2.sum(dim=-1)
-            m2_sum_sq += (acts2**2).sum(dim=-1)
+            # Update correlation statistics (all on CPU now)
+            m1_sum += acts1_cpu.sum(dim=-1)
+            m1_sum_sq += (acts1_cpu**2).sum(dim=-1)
+            m2_sum += acts2_cpu.sum(dim=-1)
+            m2_sum_sq += (acts2_cpu**2).sum(dim=-1)
             
-            # Cross product (memory intensive - compute layer by layer)
+            # Cross product (compute layer by layer to manage memory)
             for l1 in range(model1.cfg.n_layers):
                 for l2 in range(model2.cfg.n_layers):
                     cross_sum[l1, :, l2, :] += torch.mm(
-                        acts1[l1], acts2[l2].T
-                    ).cpu()
+                        acts1_cpu[l1], acts2_cpu[l2].T
+                    )
         
         # Compute Pearson correlation
         print("Computing final correlations...")
