@@ -1,5 +1,5 @@
 """
-Universal Neurons Analysis Pipeline - Modified for Checkpoint Support
+Universal Neurons Analysis Pipeline - Modified for Checkpoint Support with Disk-based Correlation Storage
 Streamlined version for replicating the universal neurons experiment across training checkpoints
 """
 
@@ -17,7 +17,7 @@ from functools import partial
 from tqdm import tqdm
 
 # ============================================================================
-# 1. NEURON STATISTICS GENERATION (MODIFIED)
+# 1. NEURON STATISTICS GENERATION (UNCHANGED)
 # ============================================================================
 
 class NeuronStatsGenerator:
@@ -248,11 +248,11 @@ class NeuronStatsGenerator:
         return full_stats
 
 # ============================================================================
-# 2. CORRELATION COMPUTATION (MODIFIED)
+# 2. CORRELATION COMPUTATION (MODIFIED FOR DISK STORAGE)
 # ============================================================================
 
 class NeuronCorrelationComputer:
-    """Compute correlations between neurons across different models"""
+    """Compute correlations between neurons across different models - with disk-based storage"""
     
     def __init__(self, model_names: List[str], device: str = "cuda", checkpoint_value: Optional[Union[int, str]] = None):
         self.model_names = model_names
@@ -310,8 +310,8 @@ class NeuronCorrelationComputer:
         return activations
     
     def compute_pairwise_correlation(self, model1_id: str, model2_id: str,
-                               dataset_path: str, batch_size: int = 32) -> torch.Tensor:
-        """Compute Pearson correlation between all neuron pairs - Fixed masking version"""
+                               dataset_path: str, output_dir: str, batch_size: int = 32) -> str:
+        """Compute Pearson correlation between all neuron pairs and save to disk immediately"""
         
         model1 = self.models[model1_id]
         model2 = self.models[model2_id]
@@ -441,12 +441,33 @@ class NeuronCorrelationComputer:
                 
                 correlations[l1, :, l2, :] = numerator / denominator
         
-        print(f"Correlation computation complete. Returning tensor to CPU...")
-        return correlations.cpu()  # Move back to CPU for saving/further processing
+        # Generate filename for this correlation pair
+        safe_model1 = model1_id.replace('/', '_').replace('-', '_')
+        safe_model2 = model2_id.replace('/', '_').replace('-', '_')
+        
+        if self.checkpoint_value is not None:
+            corr_filename = f"correlation_{safe_model1}_vs_{safe_model2}_checkpoint_{self.checkpoint_value}.pt"
+        else:
+            corr_filename = f"correlation_{safe_model1}_vs_{safe_model2}.pt"
+        
+        corr_filepath = os.path.join(output_dir, corr_filename)
+        
+        # Save immediately to disk and free GPU memory
+        print(f"Saving correlation to {corr_filepath}...")
+        torch.save({
+            'correlation_matrix': correlations.cpu(),
+            'model1': model1_id,
+            'model2': model2_id,
+            'n_samples': n_samples,
+            'checkpoint': self.checkpoint_value
+        }, corr_filepath)
+        
+        print(f"Correlation computation and save complete for {model1_id} vs {model2_id}")
+        return corr_filepath
     
-    def compute_all_correlations(self, dataset_path: str) -> Dict[Tuple[str, str], torch.Tensor]:
-        """Compute correlations between all model pairs"""
-        correlations = {}
+    def compute_all_correlations(self, dataset_path: str, output_dir: str) -> List[str]:
+        """Compute correlations between all model pairs and save each to disk immediately"""
+        correlation_files = []
         model_ids = list(self.models.keys())
         
         for i, model1 in enumerate(model_ids):
@@ -454,27 +475,33 @@ class NeuronCorrelationComputer:
                 if i == j:
                     continue  # Skip self-correlation
                 
-                pair = (model1, model2)
-                print(f"Computing correlation for pair: {pair}")
+                print(f"Computing correlation for pair: ({model1}, {model2})")
                 
-                corr_matrix = self.compute_pairwise_correlation(
-                    model1, model2, dataset_path
+                corr_file = self.compute_pairwise_correlation(
+                    model1, model2, dataset_path, output_dir
                 )
-                correlations[pair] = corr_matrix
+                correlation_files.append(corr_file)
+                
+                # Optional: force garbage collection to free memory
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        return correlations
+        return correlation_files
 
 # ============================================================================
-# 3. UNIVERSAL NEURON IDENTIFICATION (UNCHANGED)
+# 3. UNIVERSAL NEURON IDENTIFICATION (MODIFIED TO LOAD FROM DISK)
 # ============================================================================
 
 class UniversalNeuronAnalyzer:
-    """Identify and analyze universal neurons"""
+    """Identify and analyze universal neurons - modified to load correlations from disk"""
     
-    def __init__(self, correlation_results: Dict[Tuple[str, str], torch.Tensor],
-                 neuron_stats: Dict[str, pd.DataFrame]):
-        self.correlation_results = correlation_results
+    def __init__(self, correlation_files: List[str], neuron_stats: Dict[str, pd.DataFrame]):
+        self.correlation_files = correlation_files
         self.neuron_stats = neuron_stats
+        # We'll load correlations on demand to save memory
+    
+    def load_correlation_file(self, filepath: str) -> Dict:
+        """Load a single correlation file"""
+        return torch.load(filepath, map_location='cpu')
     
     def identify_universal_neurons(self, threshold: float = 0.5,
                                  min_models: int = 3) -> pd.DataFrame:
@@ -482,10 +509,18 @@ class UniversalNeuronAnalyzer:
         
         universal_neurons = []
         
-        # Get model names
+        # Get model names from correlation files
         all_models = set()
-        for (m1, m2) in self.correlation_results.keys():
-            all_models.update([m1, m2])
+        correlation_data = {}
+        
+        # Load correlation data
+        for filepath in self.correlation_files:
+            corr_data = self.load_correlation_file(filepath)
+            model1 = corr_data['model1']
+            model2 = corr_data['model2']
+            all_models.update([model1, model2])
+            correlation_data[(model1, model2)] = corr_data['correlation_matrix']
+        
         all_models = list(all_models)
         
         # For each neuron in first model, find its best matches in other models
@@ -498,11 +533,11 @@ class UniversalNeuronAnalyzer:
             
             for other_model in all_models[1:]:
                 pair_key = (first_model, other_model)
-                if pair_key not in self.correlation_results:
+                if pair_key not in correlation_data:
                     pair_key = (other_model, first_model)
                 
-                if pair_key in self.correlation_results:
-                    corr_matrix = self.correlation_results[pair_key]
+                if pair_key in correlation_data:
+                    corr_matrix = correlation_data[pair_key]
                     
                     # Find best correlation for this neuron
                     if pair_key[0] == first_model:
@@ -594,7 +629,7 @@ def run_universal_neurons_analysis(
     min_models: int = 3,
     checkpoint_value: Optional[Union[int, str]] = None
 ):
-    """Run complete universal neurons analysis pipeline"""
+    """Run complete universal neurons analysis pipeline with disk-based correlation storage"""
     
     # Modify output directory to include checkpoint info
     if checkpoint_value is not None:
@@ -628,28 +663,24 @@ def run_universal_neurons_analysis(
         stats_df.to_csv(f"{output_dir}/{filename}")
         print(f"Saved stats for {model_id}: {len(stats_df)} neurons")
     
-    # Step 2: Compute correlations between models
+    # Step 2: Compute correlations between models (with immediate disk storage)
     print("\n" + "=" * 50)
     print("STEP 2: COMPUTING INTER-MODEL CORRELATIONS")  
     print("=" * 50)
     
     correlator = NeuronCorrelationComputer(model_names, checkpoint_value=checkpoint_value)
-    correlations = correlator.compute_all_correlations(dataset_path)
+    correlation_files = correlator.compute_all_correlations(dataset_path, output_dir)
     
-    # Save correlations
-    correlation_filename = "correlations.pt"
-    if checkpoint_value is not None:
-        correlation_filename = f"correlations_checkpoint_{checkpoint_value}.pt"
-    correlation_file = f"{output_dir}/{correlation_filename}"
-    torch.save(correlations, correlation_file)
-    print(f"Saved correlations to {correlation_file}")
+    print(f"Saved {len(correlation_files)} correlation files to disk")
+    for file in correlation_files:
+        print(f"  - {os.path.basename(file)}")
     
-    # Step 3: Identify universal neurons
+    # Step 3: Identify universal neurons (loading correlations from disk as needed)
     print("\n" + "=" * 50)
     print("STEP 3: IDENTIFYING UNIVERSAL NEURONS")
     print("=" * 50)
     
-    analyzer = UniversalNeuronAnalyzer(correlations, neuron_stats)
+    analyzer = UniversalNeuronAnalyzer(correlation_files, neuron_stats)
     universal_df = analyzer.identify_universal_neurons(
         threshold=correlation_threshold,
         min_models=min_models
@@ -686,10 +717,11 @@ def run_universal_neurons_analysis(
     print(f"Universal neurons found: {len(universal_df)}")
     print(f"Mean correlation threshold: {correlation_threshold}")
     print(f"Results saved to: {output_dir}")
+    print(f"Correlation files: {len(correlation_files)} individual files")
     
     return {
         'neuron_stats': neuron_stats,
-        'correlations': correlations,
+        'correlation_files': correlation_files,  # Return file paths instead of loaded data
         'universal_neurons': universal_df,
         'analysis': analysis_df,
         'checkpoint': checkpoint_value

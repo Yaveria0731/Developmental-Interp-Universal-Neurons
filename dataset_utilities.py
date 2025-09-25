@@ -1,5 +1,5 @@
 """
-Dataset Creation and Additional Analysis Utilities - Modified for Checkpoint Support
+Dataset Creation and Additional Analysis Utilities - Modified for Checkpoint Support and Disk-based Correlations
 Supporting utilities for the universal neurons analysis across training checkpoints
 """
 
@@ -15,6 +15,7 @@ from transformer_lens import HookedTransformer
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import glob
 
 # ============================================================================
 # DATASET CREATION (UNCHANGED)
@@ -105,18 +106,60 @@ def create_tokenized_dataset(
     return save_path
 
 # ============================================================================
-# VISUALIZATION UTILITIES (MODIFIED FOR CHECKPOINT SUPPORT)
+# HELPER FUNCTIONS FOR DISK-BASED CORRELATIONS (NEW)
+# ============================================================================
+
+def load_correlations_from_files(correlation_files: List[str]) -> Dict:
+    """Load correlation data from individual files and reconstruct the dictionary format"""
+    correlations = {}
+    
+    for filepath in correlation_files:
+        corr_data = torch.load(filepath, map_location='cpu')
+        model1 = corr_data['model1']
+        model2 = corr_data['model2']
+        correlation_matrix = corr_data['correlation_matrix']
+        
+        # Store with tuple key for compatibility
+        correlations[(model1, model2)] = correlation_matrix
+    
+    return correlations
+
+def find_correlation_files(results_dir: str) -> List[str]:
+    """Find all correlation files in a results directory"""
+    # Look for files starting with "correlation_" and ending with ".pt"
+    pattern = os.path.join(results_dir, "correlation_*.pt")
+    correlation_files = glob.glob(pattern)
+    return correlation_files
+
+# ============================================================================
+# VISUALIZATION UTILITIES (MODIFIED TO HANDLE FILE-BASED CORRELATIONS)
 # ============================================================================
 
 class UniversalNeuronVisualizer:
-    """Visualization utilities for universal neuron analysis with checkpoint support"""
+    """Visualization utilities for universal neuron analysis with checkpoint support and disk-based correlations"""
     
     def __init__(self, results: Dict):
         self.neuron_stats = results['neuron_stats']
-        self.correlations = results['correlations']
+        # Handle both old format (loaded dict) and new format (file paths)
+        if 'correlations' in results:
+            self.correlations = results['correlations']
+            self.correlation_files = None
+        else:
+            self.correlation_files = results['correlation_files']
+            self.correlations = None
+        
         self.universal_neurons = results['universal_neurons']
         self.analysis = results['analysis']
         self.checkpoint = results.get('checkpoint', None)
+    
+    def _get_correlations(self) -> Dict:
+        """Get correlations dictionary, loading from files if necessary"""
+        if self.correlations is not None:
+            return self.correlations
+        elif self.correlation_files is not None:
+            return load_correlations_from_files(self.correlation_files)
+        else:
+            raise ValueError("No correlation data available")
     
     def _get_title_suffix(self) -> str:
         """Get title suffix for checkpoint-specific plots"""
@@ -125,8 +168,10 @@ class UniversalNeuronVisualizer:
     def plot_correlation_distribution(self, save_path: Optional[str] = None):
         """Plot distribution of correlation values"""
         
+        correlations = self._get_correlations()
+        
         all_corrs = []
-        for corr_matrix in self.correlations.values():
+        for corr_matrix in correlations.values():
             # Flatten correlation matrix and remove diagonal
             corrs_flat = corr_matrix.flatten()
             # Remove perfect correlations (diagonal elements)
@@ -213,11 +258,13 @@ class UniversalNeuronVisualizer:
                                       save_path: Optional[str] = None):
         """Plot correlation heatmap between two models"""
         
-        if model_pair not in self.correlations:
+        correlations = self._get_correlations()
+        
+        if model_pair not in correlations:
             # Try reverse order
             model_pair = (model_pair[1], model_pair[0])
         
-        corr_matrix = self.correlations[model_pair]
+        corr_matrix = correlations[model_pair]
         
         if layer_focus is not None:
             # Focus on specific layer
@@ -305,6 +352,8 @@ class UniversalNeuronVisualizer:
     def create_analysis_dashboard(self, save_path: str = "universal_neurons_dashboard.html"):
         """Create interactive dashboard with all visualizations"""
         
+        correlations = self._get_correlations()
+        
         # Create subplots
         fig = make_subplots(
             rows=2, cols=2,
@@ -320,7 +369,7 @@ class UniversalNeuronVisualizer:
         
         # 1. Correlation distribution
         all_corrs = []
-        for corr_matrix in self.correlations.values():
+        for corr_matrix in correlations.values():
             corrs_flat = corr_matrix.flatten()
             corrs_clean = corrs_flat[torch.abs(corrs_flat) < 0.99]
             all_corrs.extend(corrs_clean.tolist())
@@ -372,7 +421,7 @@ class UniversalNeuronVisualizer:
         return fig
 
 # ============================================================================
-# CHECKPOINT COMPARISON UTILITIES (NEW)
+# CHECKPOINT COMPARISON UTILITIES (UNCHANGED)
 # ============================================================================
 
 class CheckpointComparisonVisualizer:
@@ -547,11 +596,11 @@ class CheckpointComparisonVisualizer:
         return fig
 
 # ============================================================================
-# ANALYSIS UTILITIES (MODIFIED TO HANDLE CHECKPOINT FILENAMES)
+# ANALYSIS UTILITIES (MODIFIED TO HANDLE CHECKPOINT FILENAMES AND DISK-BASED CORRELATIONS)
 # ============================================================================
 
 def load_analysis_results(results_dir: str) -> Dict:
-    """Load saved analysis results"""
+    """Load saved analysis results with support for disk-based correlations"""
     
     results = {}
     
@@ -572,12 +621,20 @@ def load_analysis_results(results_dir: str) -> Dict:
     
     results['neuron_stats'] = neuron_stats
     
-    # Load correlations
-    for file in os.listdir(results_dir):
-        if file.startswith('correlations') and file.endswith('.pt'):
-            corr_file = os.path.join(results_dir, file)
-            results['correlations'] = torch.load(corr_file)
-            break
+    # Load correlations - check for new disk-based format first
+    correlation_files = find_correlation_files(results_dir)
+    if correlation_files:
+        print(f"Found {len(correlation_files)} correlation files")
+        results['correlation_files'] = correlation_files
+        # Also load them for backward compatibility
+        results['correlations'] = load_correlations_from_files(correlation_files)
+    else:
+        # Fall back to old single-file format
+        for file in os.listdir(results_dir):
+            if file.startswith('correlations') and file.endswith('.pt'):
+                corr_file = os.path.join(results_dir, file)
+                results['correlations'] = torch.load(corr_file)
+                break
     
     # Load universal neurons
     for file in os.listdir(results_dir):
@@ -680,7 +737,7 @@ def compute_neuron_importance_scores(neuron_stats: pd.DataFrame) -> pd.DataFrame
     return importance_scores.sort_values('importance_score', ascending=False)
 
 # ============================================================================
-# CHECKPOINT ANALYSIS UTILITIES (NEW)
+# CHECKPOINT ANALYSIS UTILITIES (UNCHANGED)
 # ============================================================================
 
 def analyze_checkpoint_progression(results_by_checkpoint: Dict[Union[int, str], Dict]) -> pd.DataFrame:

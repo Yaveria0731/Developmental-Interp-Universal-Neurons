@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete Example: Universal Neurons Analysis with Checkpoint Support
+Complete Example: Universal Neurons Analysis with Checkpoint Support and Disk-based Correlations
 This script demonstrates the full pipeline for finding universal neurons
 across different training checkpoints of Stanford CRFM GPT2-small models.
 """
@@ -18,7 +18,8 @@ from dataset_utilities import (
     UniversalNeuronVisualizer,
     load_analysis_results,
     find_similar_neurons,
-    compute_neuron_importance_scores
+    compute_neuron_importance_scores,
+    load_correlations_from_files
 )
 
 def main(checkpoint_value: Optional[Union[int, str]] = None):
@@ -137,8 +138,15 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     )
     
     print("Creating correlation matrix heatmaps...")
-    # Create heatmaps for first few model pairs
-    model_pairs = list(results['correlations'].keys())[:3]
+    # Get model pairs from correlation files instead of loaded dictionary
+    if 'correlation_files' in results:
+        # Load first few correlation files to get model pairs
+        correlation_data = load_correlations_from_files(results['correlation_files'][:3])
+        model_pairs = list(correlation_data.keys())
+    else:
+        # Fallback if old format still used
+        model_pairs = list(results['correlations'].keys())[:3]
+    
     for i, pair in enumerate(model_pairs):
         visualizer.plot_correlation_matrix_heatmap(
             model_pair=pair,
@@ -251,6 +259,11 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     print(f"  - {CONFIG['output_dir']}/universal_analysis{checkpoint_suffix}.csv")  
     print(f"  - {plots_dir}/dashboard{checkpoint_suffix}.html (interactive dashboard)")
     print(f"  - {plots_dir}/*{checkpoint_suffix}.png (static plots)")
+    
+    # Show correlation files info
+    if 'correlation_files' in results:
+        print(f"  - {len(results['correlation_files'])} individual correlation files")
+        print("    (stored separately to reduce memory usage)")
     
     print(f"\nNext steps:")
     print(f"  1. Open dashboard{checkpoint_suffix}.html in browser for interactive exploration")
