@@ -132,8 +132,30 @@ class NeuronStatsGenerator:
         
         # Load tokenized dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
+        
+        # Check dataset structure and handle accordingly
+        if hasattr(tokenized_dataset, 'column_names') and 'tokens' in tokenized_dataset.column_names:
+            # Dataset has 'tokens' column
+            dataset_to_use = tokenized_dataset['tokens']
+        else:
+            # Dataset is directly the tokens
+            dataset_to_use = tokenized_dataset
+        
+        # Convert tokens to tensor format for DataLoader
+        def collate_fn(batch):
+            # Handle different batch formats
+            if isinstance(batch[0], list):
+                # batch is a list of token sequences
+                return torch.tensor(batch, dtype=torch.long)
+            elif isinstance(batch[0], dict) and 'tokens' in batch[0]:
+                # batch is a list of dicts with 'tokens' key
+                return torch.tensor([item['tokens'] for item in batch], dtype=torch.long)
+            else:
+                # batch is already in the right format
+                return torch.tensor(batch, dtype=torch.long)
+        
         dataloader = DataLoader(
-            tokenized_dataset['tokens'], batch_size=batch_size, shuffle=False
+            dataset_to_use, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
         )
         
         # Initialize accumulators
@@ -232,7 +254,7 @@ class NeuronCorrelationComputer:
     
     def __init__(self, model_names: List[str], device: str = "cuda", checkpoint_value: Optional[Union[int, str]] = None):
         self.model_names = model_names
-        self.device = device
+        self.requested_device = device  # Store requested device
         self.checkpoint_value = checkpoint_value
         self.models = {}
         
@@ -253,6 +275,10 @@ class NeuronCorrelationComputer:
             model.eval()
             self.models[model_id] = model
         torch.set_grad_enabled(False)
+    
+    def get_model_device(self, model):
+        """Get the actual device of model parameters"""
+        return next(model.parameters()).device
     
     def get_activations(self, model, inputs) -> torch.Tensor:
         """Get MLP activations for all layers"""
@@ -288,11 +314,36 @@ class NeuronCorrelationComputer:
         model1 = self.models[model1_id]
         model2 = self.models[model2_id]
         
+        # Get actual devices
+        device1 = self.get_model_device(model1)
+        device2 = self.get_model_device(model2)
+        
         # Load dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
+        
+        # Check dataset structure and handle accordingly
+        if hasattr(tokenized_dataset, 'column_names') and 'tokens' in tokenized_dataset.column_names:
+            # Dataset has 'tokens' column
+            dataset_to_use = tokenized_dataset['tokens']
+        else:
+            # Dataset is directly the tokens
+            dataset_to_use = tokenized_dataset
+        
+        # Convert tokens to tensor format for DataLoader
+        def collate_fn(batch):
+            # Handle different batch formats
+            if isinstance(batch[0], list):
+                # batch is a list of token sequences
+                return torch.tensor(batch, dtype=torch.long)
+            elif isinstance(batch[0], dict) and 'tokens' in batch[0]:
+                # batch is a list of dicts with 'tokens' key
+                return torch.tensor([item['tokens'] for item in batch], dtype=torch.long)
+            else:
+                # batch is already in the right format
+                return torch.tensor(batch, dtype=torch.long)
+        
         dataloader = DataLoader(
-            tokenized_dataset['tokens'],
-            batch_size=batch_size, shuffle=False
+            dataset_to_use, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
         )
         
         # Initialize correlation computation
@@ -310,10 +361,15 @@ class NeuronCorrelationComputer:
         
         print(f"Computing correlation between {model1_id} and {model2_id}")
         for batch in tqdm(dataloader):
-            batch = batch.to(self.device)
+            # Send batch to first model's device
+            batch = batch.to(device1)
             
             # Get activations
             acts1 = self.get_activations(model1, batch)  # [l1, d1, t]
+            
+            # Send batch to second model's device if different
+            if device1 != device2:
+                batch = batch.to(device2)
             acts2 = self.get_activations(model2, batch)  # [l2, d2, t]
             
             # Filter padding tokens
