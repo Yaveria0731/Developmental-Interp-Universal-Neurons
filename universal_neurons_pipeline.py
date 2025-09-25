@@ -43,9 +43,14 @@ class NeuronStatsGenerator:
         self.model.eval()
         torch.set_grad_enabled(False)
     
+    def get_model_device(self):
+        """Get the actual device of the model parameters"""
+        return next(self.model.parameters()).device
+    
     def compute_weight_statistics(self) -> pd.DataFrame:
         """Compute weight-based statistics for all neurons"""
-        device = self.model.device
+        # Use the actual device of model parameters
+        device = self.get_model_device()
         
         # Get weight matrices
         W_in = einops.rearrange(self.model.W_in, 'l d n -> l n d').to(device)
@@ -81,7 +86,7 @@ class NeuronStatsGenerator:
     
     def compute_vocab_composition_stats(self) -> pd.DataFrame:
         """Compute vocabulary composition statistics"""
-        device = self.model.device
+        device = self.get_model_device()
         
         # Normalize embeddings
         W_U = self.model.W_U / self.model.W_U.norm(dim=0, keepdim=True)
@@ -123,6 +128,8 @@ class NeuronStatsGenerator:
                                     batch_size: int = 32) -> pd.DataFrame:
         """Compute activation-based statistics on a dataset"""
         
+        device = self.get_model_device()
+        
         # Load tokenized dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
         dataloader = DataLoader(
@@ -133,9 +140,9 @@ class NeuronStatsGenerator:
         n_layers = self.model.cfg.n_layers
         d_mlp = self.model.cfg.d_mlp
         
-        activation_sums = torch.zeros(n_layers, d_mlp, device=self.device)
-        activation_sum_sq = torch.zeros(n_layers, d_mlp, device=self.device)
-        sparsity_counts = torch.zeros(n_layers, d_mlp, device=self.device)
+        activation_sums = torch.zeros(n_layers, d_mlp, device=device)
+        activation_sum_sq = torch.zeros(n_layers, d_mlp, device=device)
+        sparsity_counts = torch.zeros(n_layers, d_mlp, device=device)
         total_tokens = 0
         
         def save_activations(tensor, hook):
@@ -146,7 +153,7 @@ class NeuronStatsGenerator:
                 for layer in range(n_layers)]
         
         for batch in tqdm(dataloader, desc="Computing activation stats"):
-            batch = batch.to(self.device)
+            batch = batch.to(device)
             
             with torch.no_grad():
                 self.model.run_with_hooks(batch, fwd_hooks=hooks)
