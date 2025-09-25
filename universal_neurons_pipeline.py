@@ -311,12 +311,12 @@ class NeuronCorrelationComputer:
     
     def compute_pairwise_correlation(self, model1_id: str, model2_id: str,
                                dataset_path: str, batch_size: int = 32) -> torch.Tensor:
-        """Compute Pearson correlation between all neuron pairs - Full GPU version for high-end GPUs"""
+        """Compute Pearson correlation between all neuron pairs - Fixed masking version"""
         
         model1 = self.models[model1_id]
         model2 = self.models[model2_id]
         
-        # Get actual devices - should be GPU for L40/A100
+        # Get actual devices
         device1 = self.get_model_device(model1)
         device2 = self.get_model_device(model2)
         
@@ -372,26 +372,33 @@ class NeuronCorrelationComputer:
         
         print(f"Computing correlation between {model1_id} and {model2_id}")
         for batch in tqdm(dataloader):
+            # Keep original batch for consistent masking
+            original_batch = batch.clone()
+            
             # Send batch to model devices
-            batch = batch.to(device1)
+            batch1 = batch.to(device1)
+            batch2 = batch.to(device2) if device1 != device2 else batch1
             
             # Get activations
-            acts1 = self.get_activations(model1, batch)  # [l1, d1, t]
+            acts1 = self.get_activations(model1, batch1)  # [l1, d1, t]
+            acts2 = self.get_activations(model2, batch2)  # [l2, d2, t]
             
-            if device1 != device2:
-                batch = batch.to(device2)
-            acts2 = self.get_activations(model2, batch)  # [l2, d2, t]
+            # Create consistent valid mask from original batch (before device transfer)
+            valid_mask = (original_batch.flatten() != 0)
             
-            # Filter padding tokens - ensure mask is on same device as activations
-            valid_mask = (batch.flatten() != 0)
-            
-            # Move activations to compute device first, then apply mask
+            # Move activations to compute device
             acts1_compute = acts1.to(compute_device)
-            acts2_compute = acts2.to(compute_device)
+            acts2_compute = acts2.to(compute_device) 
             valid_mask_compute = valid_mask.to(compute_device)
             
+            # Apply the same mask to both activation tensors
             acts1_filtered = acts1_compute[:, :, valid_mask_compute]
             acts2_filtered = acts2_compute[:, :, valid_mask_compute]
+            
+            # Verify shapes are consistent
+            if acts1_filtered.shape[-1] != acts2_filtered.shape[-1]:
+                print(f"Warning: Shape mismatch after masking: {acts1_filtered.shape} vs {acts2_filtered.shape}")
+                continue  # Skip this batch
             
             n_tokens = acts1_filtered.shape[-1]
             if n_tokens == 0:  # Skip empty batches
@@ -405,16 +412,12 @@ class NeuronCorrelationComputer:
             m2_sum += acts2_filtered.sum(dim=-1)
             m2_sum_sq += (acts2_filtered**2).sum(dim=-1)
             
-            # Compute cross products - this is where GPU really shines
-            # Use einsum for efficient batch computation across all layer pairs
-            cross_sum += torch.einsum('ijk,ljk->iljk', acts1_filtered, acts2_filtered)
-            
-            # Alternative: nested loops (slightly more memory efficient but slower)
-            # for l1 in range(model1.cfg.n_layers):
-            #     for l2 in range(model2.cfg.n_layers):
-            #         cross_sum[l1, :, l2, :] += torch.mm(
-            #             acts1_filtered[l1], acts2_filtered[l2].T
-            #         )
+            # Compute cross products - use nested loops for safety
+            for l1 in range(model1.cfg.n_layers):
+                for l2 in range(model2.cfg.n_layers):
+                    cross_sum[l1, :, l2, :] += torch.mm(
+                        acts1_filtered[l1], acts2_filtered[l2].T
+                    )
         
         if n_samples == 0:
             raise ValueError("No valid samples found in dataset")
