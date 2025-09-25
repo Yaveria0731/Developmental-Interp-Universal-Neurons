@@ -145,14 +145,16 @@ class NeuronStatsGenerator:
         def collate_fn(batch):
             # Handle different batch formats
             if isinstance(batch[0], list):
-                # batch is a list of token sequences
-                return torch.tensor(batch, dtype=torch.long)
+                sequences = batch
             elif isinstance(batch[0], dict) and 'tokens' in batch[0]:
-                # batch is a list of dicts with 'tokens' key
-                return torch.tensor([item['tokens'] for item in batch], dtype=torch.long)
+                sequences = [item['tokens'] for item in batch]
             else:
-                # batch is already in the right format
-                return torch.tensor(batch, dtype=torch.long)
+                sequences = batch
+            
+            # Pad to max length in batch
+            max_len = max(len(seq) for seq in sequences)
+            padded = [seq + [0] * (max_len - len(seq)) for seq in sequences]
+            return torch.tensor(padded, dtype=torch.long)
         
         dataloader = DataLoader(
             dataset_to_use, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
@@ -333,14 +335,16 @@ class NeuronCorrelationComputer:
         def collate_fn(batch):
             # Handle different batch formats
             if isinstance(batch[0], list):
-                # batch is a list of token sequences
-                return torch.tensor(batch, dtype=torch.long)
+                sequences = batch
             elif isinstance(batch[0], dict) and 'tokens' in batch[0]:
-                # batch is a list of dicts with 'tokens' key
-                return torch.tensor([item['tokens'] for item in batch], dtype=torch.long)
+                sequences = [item['tokens'] for item in batch]
             else:
-                # batch is already in the right format
-                return torch.tensor(batch, dtype=torch.long)
+                sequences = batch
+            
+            # Pad to max length in batch
+            max_len = max(len(seq) for seq in sequences)
+            padded = [seq + [0] * (max_len - len(seq)) for seq in sequences]
+            return torch.tensor(padded, dtype=torch.long)
         
         dataloader = DataLoader(
             dataset_to_use, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
