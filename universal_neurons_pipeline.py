@@ -287,7 +287,7 @@ class NeuronCorrelationComputer:
         hooks = []
         
         def save_activation_hook(tensor, hook):
-            hook.ctx['activation'] = tensor.detach().cpu()
+            hook.ctx['activation'] = tensor.detach()
         
         # Set up hooks for all MLP layers
         for layer in range(model.cfg.n_layers):
@@ -382,10 +382,16 @@ class NeuronCorrelationComputer:
                 batch = batch.to(device2)
             acts2 = self.get_activations(model2, batch)  # [l2, d2, t]
             
-            # Filter padding tokens and move to compute device
+            # Filter padding tokens - ensure mask is on same device as activations
             valid_mask = (batch.flatten() != 0)
-            acts1_filtered = acts1[:, :, valid_mask].to(compute_device)
-            acts2_filtered = acts2[:, :, valid_mask].to(compute_device)
+            
+            # Move activations to compute device first, then apply mask
+            acts1_compute = acts1.to(compute_device)
+            acts2_compute = acts2.to(compute_device)
+            valid_mask_compute = valid_mask.to(compute_device)
+            
+            acts1_filtered = acts1_compute[:, :, valid_mask_compute]
+            acts2_filtered = acts2_compute[:, :, valid_mask_compute]
             
             n_tokens = acts1_filtered.shape[-1]
             if n_tokens == 0:  # Skip empty batches
