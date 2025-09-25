@@ -310,26 +310,28 @@ class NeuronCorrelationComputer:
         return activations
     
     def compute_pairwise_correlation(self, model1_id: str, model2_id: str,
-                                   dataset_path: str, batch_size: int = 32) -> torch.Tensor:
-        """Compute Pearson correlation between all neuron pairs"""
+                               dataset_path: str, batch_size: int = 32) -> torch.Tensor:
+        """Compute Pearson correlation between all neuron pairs - Full GPU version for high-end GPUs"""
         
         model1 = self.models[model1_id]
         model2 = self.models[model2_id]
         
-        # Get actual devices
+        # Get actual devices - should be GPU for L40/A100
         device1 = self.get_model_device(model1)
         device2 = self.get_model_device(model2)
+        
+        # Use GPU for all computation
+        compute_device = device1 if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {compute_device}")
         
         # Load dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
         
-        # Check dataset structure and handle accordingly
         if hasattr(tokenized_dataset, 'column_names') and 'tokens' in tokenized_dataset.column_names:
             dataset_to_use = tokenized_dataset['tokens']
         else:
             dataset_to_use = tokenized_dataset
         
-        # Simple collate function to handle variable lengths
         def collate_fn(batch):
             if isinstance(batch[0], list):
                 sequences = batch
@@ -338,7 +340,6 @@ class NeuronCorrelationComputer:
             else:
                 sequences = batch
             
-            # Pad to max length in batch
             max_len = max(len(seq) for seq in sequences)
             padded = [seq + [0] * (max_len - len(seq)) for seq in sequences]
             return torch.tensor(padded, dtype=torch.long)
@@ -347,59 +348,76 @@ class NeuronCorrelationComputer:
             dataset_to_use, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
         )
         
-        # Initialize correlation computation - keep everything on CPU to avoid memory issues
-        m1_sum = torch.zeros(model1.cfg.n_layers, model1.cfg.d_mlp, dtype=torch.float64)
-        m1_sum_sq = torch.zeros(model1.cfg.n_layers, model1.cfg.d_mlp, dtype=torch.float64)
-        m2_sum = torch.zeros(model2.cfg.n_layers, model2.cfg.d_mlp, dtype=torch.float64) 
-        m2_sum_sq = torch.zeros(model2.cfg.n_layers, model2.cfg.d_mlp, dtype=torch.float64)
+        # Initialize correlation computation - all on GPU now
+        m1_sum = torch.zeros(model1.cfg.n_layers, model1.cfg.d_mlp, 
+                            dtype=torch.float64, device=compute_device)
+        m1_sum_sq = torch.zeros(model1.cfg.n_layers, model1.cfg.d_mlp, 
+                            dtype=torch.float64, device=compute_device)
+        m2_sum = torch.zeros(model2.cfg.n_layers, model2.cfg.d_mlp, 
+                            dtype=torch.float64, device=compute_device) 
+        m2_sum_sq = torch.zeros(model2.cfg.n_layers, model2.cfg.d_mlp, 
+                            dtype=torch.float64, device=compute_device)
         
+        # Full cross-correlation tensor - this is what requires ~11GB
         cross_sum = torch.zeros(
             model1.cfg.n_layers, model1.cfg.d_mlp,
             model2.cfg.n_layers, model2.cfg.d_mlp,
-            dtype=torch.float64
+            dtype=torch.float64, device=compute_device
         )
         n_samples = 0
         
+        print(f"Allocated correlation tensors on {compute_device}")
+        print(f"Cross-correlation tensor shape: {cross_sum.shape}")
+        print(f"Estimated GPU memory usage: {cross_sum.numel() * 8 / (1024**3):.1f} GB")
+        
         print(f"Computing correlation between {model1_id} and {model2_id}")
         for batch in tqdm(dataloader):
-            # Send batch to first model's device
+            # Send batch to model devices
             batch = batch.to(device1)
             
-            # Get activations from first model
+            # Get activations
             acts1 = self.get_activations(model1, batch)  # [l1, d1, t]
             
-            # Send batch to second model's device if different
             if device1 != device2:
                 batch = batch.to(device2)
             acts2 = self.get_activations(model2, batch)  # [l2, d2, t]
             
-            # Filter padding tokens - use the batch from device1 for consistency
+            # Filter padding tokens and move to compute device
             valid_mask = (batch.flatten() != 0)
+            acts1_filtered = acts1[:, :, valid_mask].to(compute_device)
+            acts2_filtered = acts2[:, :, valid_mask].to(compute_device)
             
-            # Move activations to CPU and filter
-            acts1_cpu = acts1.cpu()[:, :, valid_mask.cpu()]
-            acts2_cpu = acts2.cpu()[:, :, valid_mask.cpu()]
-            
-            n_tokens = acts1_cpu.shape[-1]
+            n_tokens = acts1_filtered.shape[-1]
+            if n_tokens == 0:  # Skip empty batches
+                continue
+                
             n_samples += n_tokens
             
-            # Update correlation statistics (all on CPU now)
-            m1_sum += acts1_cpu.sum(dim=-1)
-            m1_sum_sq += (acts1_cpu**2).sum(dim=-1)
-            m2_sum += acts2_cpu.sum(dim=-1)
-            m2_sum_sq += (acts2_cpu**2).sum(dim=-1)
+            # Update first and second moment statistics
+            m1_sum += acts1_filtered.sum(dim=-1)
+            m1_sum_sq += (acts1_filtered**2).sum(dim=-1)
+            m2_sum += acts2_filtered.sum(dim=-1)
+            m2_sum_sq += (acts2_filtered**2).sum(dim=-1)
             
-            # Cross product (compute layer by layer to manage memory)
-            for l1 in range(model1.cfg.n_layers):
-                for l2 in range(model2.cfg.n_layers):
-                    cross_sum[l1, :, l2, :] += torch.mm(
-                        acts1_cpu[l1], acts2_cpu[l2].T
-                    )
+            # Compute cross products - this is where GPU really shines
+            # Use einsum for efficient batch computation across all layer pairs
+            cross_sum += torch.einsum('ijk,ljk->iljk', acts1_filtered, acts2_filtered)
+            
+            # Alternative: nested loops (slightly more memory efficient but slower)
+            # for l1 in range(model1.cfg.n_layers):
+            #     for l2 in range(model2.cfg.n_layers):
+            #         cross_sum[l1, :, l2, :] += torch.mm(
+            #             acts1_filtered[l1], acts2_filtered[l2].T
+            #         )
         
-        # Compute Pearson correlation
-        print("Computing final correlations...")
-        correlations = torch.zeros_like(cross_sum)
+        if n_samples == 0:
+            raise ValueError("No valid samples found in dataset")
         
+        # Compute Pearson correlation - all on GPU
+        print("Computing final correlations on GPU...")
+        correlations = torch.zeros_like(cross_sum, device=compute_device)
+        
+        # Vectorized computation across all layer pairs
         for l1 in range(model1.cfg.n_layers):
             for l2 in range(model2.cfg.n_layers):
                 # Numerator: E[XY] - E[X]E[Y]
@@ -410,11 +428,12 @@ class NeuronCorrelationComputer:
                 # Denominator: sqrt(Var[X] * Var[Y])
                 var1 = m1_sum_sq[l1] / n_samples - (m1_sum[l1] / n_samples)**2
                 var2 = m2_sum_sq[l2] / n_samples - (m2_sum[l2] / n_samples)**2
-                denominator = torch.outer(torch.sqrt(var1), torch.sqrt(var2))
+                denominator = torch.outer(torch.sqrt(var1 + 1e-8), torch.sqrt(var2 + 1e-8))
                 
-                correlations[l1, :, l2, :] = numerator / (denominator + 1e-8)
+                correlations[l1, :, l2, :] = numerator / denominator
         
-        return correlations
+        print(f"Correlation computation complete. Returning tensor to CPU...")
+        return correlations.cpu()  # Move back to CPU for saving/further processing
     
     def compute_all_correlations(self, dataset_path: str) -> Dict[Tuple[str, str], torch.Tensor]:
         """Compute correlations between all model pairs"""
