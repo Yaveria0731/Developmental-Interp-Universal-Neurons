@@ -22,7 +22,7 @@ from plotly.subplots import make_subplots
 
 def create_tokenized_dataset(
     model_name: str,
-    hf_dataset: str = "NeelNanda/pile-10k", 
+    hf_dataset: str = "monology/pile-uncopyrighted", 
     hf_split: str = "train",
     n_tokens: int = 1000000,
     ctx_len: int = 512,
