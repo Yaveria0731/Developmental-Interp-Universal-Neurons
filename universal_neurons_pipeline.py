@@ -258,7 +258,7 @@ class NeuronCorrelationComputer:
         # Load dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
         dataloader = DataLoader(
-            tokenized_dataset['tokens'][:1000],  # Limit for memory
+            tokenized_dataset['tokens'],  # Limit for memory
             batch_size=batch_size, shuffle=False
         )
         
