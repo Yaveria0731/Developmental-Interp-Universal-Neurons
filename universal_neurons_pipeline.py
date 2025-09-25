@@ -1,6 +1,6 @@
 """
-Universal Neurons Analysis Pipeline
-Streamlined version for replicating the universal neurons experiment
+Universal Neurons Analysis Pipeline - Modified for Checkpoint Support
+Streamlined version for replicating the universal neurons experiment across training checkpoints
 """
 
 import os
@@ -9,7 +9,7 @@ import datasets
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from transformer_lens import HookedTransformer
 from torch.utils.data import DataLoader
 import einops
@@ -17,16 +17,29 @@ from functools import partial
 from tqdm import tqdm
 
 # ============================================================================
-# 1. NEURON STATISTICS GENERATION
+# 1. NEURON STATISTICS GENERATION (MODIFIED)
 # ============================================================================
 
 class NeuronStatsGenerator:
     """Generate comprehensive statistics for all neurons in a model"""
     
-    def __init__(self, model_name: str, device: str = "cuda"):
+    def __init__(self, model_name: str, device: str = "cuda", checkpoint_value: Optional[Union[int, str]] = None):
         self.model_name = model_name
         self.device = device
-        self.model = HookedTransformer.from_pretrained(model_name, device=device)
+        self.checkpoint_value = checkpoint_value
+        
+        # Load model with checkpoint if specified
+        if checkpoint_value is not None:
+            self.model = HookedTransformer.from_pretrained(
+                model_name, 
+                device=device, 
+                checkpoint_value=checkpoint_value
+            )
+            self.model_identifier = f"{model_name}_checkpoint_{checkpoint_value}"
+        else:
+            self.model = HookedTransformer.from_pretrained(model_name, device=device)
+            self.model_identifier = model_name
+            
         self.model.eval()
         torch.set_grad_enabled(False)
     
@@ -177,7 +190,7 @@ class NeuronStatsGenerator:
     
     def generate_full_neuron_dataframe(self, dataset_path: Optional[str] = None) -> pd.DataFrame:
         """Generate complete neuron statistics dataframe"""
-        print(f"Generating neuron statistics for {self.model_name}")
+        print(f"Generating neuron statistics for {self.model_identifier}")
         
         # Compute weight statistics
         print("Computing weight statistics...")
@@ -196,29 +209,42 @@ class NeuronStatsGenerator:
             activation_stats = self.compute_activation_statistics(dataset_path)
             full_stats = pd.concat([full_stats, activation_stats], axis=1)
         
-        # Add model name for identification
-        full_stats['model'] = self.model_name
+        # Add model name and checkpoint for identification
+        full_stats['model'] = self.model_identifier
+        if self.checkpoint_value is not None:
+            full_stats['checkpoint'] = self.checkpoint_value
         
         return full_stats
 
 # ============================================================================
-# 2. CORRELATION COMPUTATION
+# 2. CORRELATION COMPUTATION (MODIFIED)
 # ============================================================================
 
 class NeuronCorrelationComputer:
     """Compute correlations between neurons across different models"""
     
-    def __init__(self, model_names: List[str], device: str = "cuda"):
+    def __init__(self, model_names: List[str], device: str = "cuda", checkpoint_value: Optional[Union[int, str]] = None):
         self.model_names = model_names
         self.device = device
+        self.checkpoint_value = checkpoint_value
         self.models = {}
         
         print("Loading models...")
         for name in model_names:
             print(f"Loading {name}...")
-            model = HookedTransformer.from_pretrained(name, device=device)
+            if checkpoint_value is not None:
+                model = HookedTransformer.from_pretrained(
+                    name, 
+                    device=device, 
+                    checkpoint_value=checkpoint_value
+                )
+                model_id = f"{name}_checkpoint_{checkpoint_value}"
+            else:
+                model = HookedTransformer.from_pretrained(name, device=device)
+                model_id = name
+                
             model.eval()
-            self.models[name] = model
+            self.models[model_id] = model
         torch.set_grad_enabled(False)
     
     def get_activations(self, model, inputs) -> torch.Tensor:
@@ -248,17 +274,17 @@ class NeuronCorrelationComputer:
         
         return activations
     
-    def compute_pairwise_correlation(self, model1_name: str, model2_name: str,
+    def compute_pairwise_correlation(self, model1_id: str, model2_id: str,
                                    dataset_path: str, batch_size: int = 32) -> torch.Tensor:
         """Compute Pearson correlation between all neuron pairs"""
         
-        model1 = self.models[model1_name]
-        model2 = self.models[model2_name]
+        model1 = self.models[model1_id]
+        model2 = self.models[model2_id]
         
         # Load dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
         dataloader = DataLoader(
-            tokenized_dataset['tokens'],  # Limit for memory
+            tokenized_dataset['tokens'],
             batch_size=batch_size, shuffle=False
         )
         
@@ -275,7 +301,7 @@ class NeuronCorrelationComputer:
         )
         n_samples = 0
         
-        print(f"Computing correlation between {model1_name} and {model2_name}")
+        print(f"Computing correlation between {model1_id} and {model2_id}")
         for batch in tqdm(dataloader):
             batch = batch.to(self.device)
             
@@ -327,9 +353,10 @@ class NeuronCorrelationComputer:
     def compute_all_correlations(self, dataset_path: str) -> Dict[Tuple[str, str], torch.Tensor]:
         """Compute correlations between all model pairs"""
         correlations = {}
+        model_ids = list(self.models.keys())
         
-        for i, model1 in enumerate(self.model_names):
-            for j, model2 in enumerate(self.model_names[i:], i):
+        for i, model1 in enumerate(model_ids):
+            for j, model2 in enumerate(model_ids[i:], i):
                 if i == j:
                     continue  # Skip self-correlation
                 
@@ -344,7 +371,7 @@ class NeuronCorrelationComputer:
         return correlations
 
 # ============================================================================
-# 3. UNIVERSAL NEURON IDENTIFICATION
+# 3. UNIVERSAL NEURON IDENTIFICATION (UNCHANGED)
 # ============================================================================
 
 class UniversalNeuronAnalyzer:
@@ -462,7 +489,7 @@ class UniversalNeuronAnalyzer:
         return pd.DataFrame(analysis_results)
 
 # ============================================================================
-# 4. MAIN PIPELINE
+# 4. MAIN PIPELINE (MODIFIED)
 # ============================================================================
 
 def run_universal_neurons_analysis(
@@ -470,38 +497,56 @@ def run_universal_neurons_analysis(
     dataset_path: str,
     output_dir: str = "universal_neurons_results",
     correlation_threshold: float = 0.5,
-    min_models: int = 3
+    min_models: int = 3,
+    checkpoint_value: Optional[Union[int, str]] = None
 ):
     """Run complete universal neurons analysis pipeline"""
+    
+    # Modify output directory to include checkpoint info
+    if checkpoint_value is not None:
+        output_dir = f"{output_dir}_checkpoint_{checkpoint_value}"
     
     os.makedirs(output_dir, exist_ok=True)
     
     # Step 1: Generate neuron statistics for each model
     print("=" * 50)
     print("STEP 1: GENERATING NEURON STATISTICS")
+    if checkpoint_value is not None:
+        print(f"CHECKPOINT: {checkpoint_value}")
     print("=" * 50)
     
     neuron_stats = {}
     for model_name in model_names:
         print(f"\nProcessing {model_name}...")
-        generator = NeuronStatsGenerator(model_name)
+        generator = NeuronStatsGenerator(model_name, checkpoint_value=checkpoint_value)
         stats_df = generator.generate_full_neuron_dataframe(dataset_path)
-        neuron_stats[model_name] = stats_df
         
-        # Save individual model stats
-        stats_df.to_csv(f"{output_dir}/{model_name.replace('/', '_')}_neuron_stats.csv")
-        print(f"Saved stats for {model_name}: {len(stats_df)} neurons")
+        # Use the model identifier that includes checkpoint info
+        model_id = generator.model_identifier
+        neuron_stats[model_id] = stats_df
+        
+        # Save individual model stats with checkpoint info in filename
+        safe_model_name = model_name.replace('/', '_')
+        if checkpoint_value is not None:
+            filename = f"{safe_model_name}_checkpoint_{checkpoint_value}_neuron_stats.csv"
+        else:
+            filename = f"{safe_model_name}_neuron_stats.csv"
+        stats_df.to_csv(f"{output_dir}/{filename}")
+        print(f"Saved stats for {model_id}: {len(stats_df)} neurons")
     
     # Step 2: Compute correlations between models
     print("\n" + "=" * 50)
     print("STEP 2: COMPUTING INTER-MODEL CORRELATIONS")  
     print("=" * 50)
     
-    correlator = NeuronCorrelationComputer(model_names)
+    correlator = NeuronCorrelationComputer(model_names, checkpoint_value=checkpoint_value)
     correlations = correlator.compute_all_correlations(dataset_path)
     
     # Save correlations
-    correlation_file = f"{output_dir}/correlations.pt"
+    correlation_filename = "correlations.pt"
+    if checkpoint_value is not None:
+        correlation_filename = f"correlations_checkpoint_{checkpoint_value}.pt"
+    correlation_file = f"{output_dir}/{correlation_filename}"
     torch.save(correlations, correlation_file)
     print(f"Saved correlations to {correlation_file}")
     
@@ -516,7 +561,10 @@ def run_universal_neurons_analysis(
         min_models=min_models
     )
     
-    universal_file = f"{output_dir}/universal_neurons.csv"
+    universal_filename = "universal_neurons.csv"
+    if checkpoint_value is not None:
+        universal_filename = f"universal_neurons_checkpoint_{checkpoint_value}.csv"
+    universal_file = f"{output_dir}/{universal_filename}"
     universal_df.to_csv(universal_file, index=False)
     print(f"Found {len(universal_df)} universal neurons")
     print(f"Saved to {universal_file}")
@@ -527,7 +575,10 @@ def run_universal_neurons_analysis(
     print("=" * 50)
     
     analysis_df = analyzer.analyze_universal_properties(universal_df)
-    analysis_file = f"{output_dir}/universal_analysis.csv"
+    analysis_filename = "universal_analysis.csv"
+    if checkpoint_value is not None:
+        analysis_filename = f"universal_analysis_checkpoint_{checkpoint_value}.csv"
+    analysis_file = f"{output_dir}/{analysis_filename}"
     analysis_df.to_csv(analysis_file, index=False)
     print(f"Saved analysis to {analysis_file}")
     
@@ -536,6 +587,8 @@ def run_universal_neurons_analysis(
     print("ANALYSIS COMPLETE - SUMMARY")
     print("=" * 50)
     print(f"Models analyzed: {len(model_names)}")
+    if checkpoint_value is not None:
+        print(f"Checkpoint: {checkpoint_value}")
     print(f"Universal neurons found: {len(universal_df)}")
     print(f"Mean correlation threshold: {correlation_threshold}")
     print(f"Results saved to: {output_dir}")
@@ -544,11 +597,12 @@ def run_universal_neurons_analysis(
         'neuron_stats': neuron_stats,
         'correlations': correlations,
         'universal_neurons': universal_df,
-        'analysis': analysis_df
+        'analysis': analysis_df,
+        'checkpoint': checkpoint_value
     }
 
 # ============================================================================
-# 5. USAGE EXAMPLE
+# 5. USAGE EXAMPLE (UNCHANGED FROM ORIGINAL)
 # ============================================================================
 
 if __name__ == "__main__":
@@ -570,5 +624,6 @@ if __name__ == "__main__":
         dataset_path=dataset_path,
         output_dir="universal_neurons_results",
         correlation_threshold=0.5,
-        min_models=3
+        min_models=3,
+        checkpoint_value=1000  # Example: analyze at step 1000
     )

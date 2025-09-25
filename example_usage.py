@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Complete Example: Universal Neurons Analysis
+Complete Example: Universal Neurons Analysis with Checkpoint Support
 This script demonstrates the full pipeline for finding universal neurons
-across the Stanford CRFM GPT2-small models.
+across different training checkpoints of Stanford CRFM GPT2-small models.
 """
 
 import os
 import sys
+import argparse
 from pathlib import Path
+from typing import Optional, Union
 
 # Import our pipeline modules
 from universal_neurons_pipeline import run_universal_neurons_analysis
@@ -19,11 +21,13 @@ from dataset_utilities import (
     compute_neuron_importance_scores
 )
 
-def main():
+def main(checkpoint_value: Optional[Union[int, str]] = None):
     """Main execution pipeline"""
     
     print("=" * 60)
     print("UNIVERSAL NEURONS ANALYSIS - STANFORD CRFM MODELS")
+    if checkpoint_value is not None:
+        print(f"CHECKPOINT: {checkpoint_value}")
     print("=" * 60)
     
     # ========================================================================
@@ -49,9 +53,15 @@ def main():
         'dataset_dir': 'datasets'
     }
     
+    # Modify output directory for checkpoint
+    if checkpoint_value is not None:
+        CONFIG['output_dir'] = f"{CONFIG['output_dir']}_checkpoint_{checkpoint_value}"
+    
     print(f"Models to analyze: {len(MODELS)}")
     print(f"Correlation threshold: {CONFIG['correlation_threshold']}")
     print(f"Minimum models: {CONFIG['min_models']}")
+    if checkpoint_value is not None:
+        print(f"Checkpoint: {checkpoint_value}")
     
     # ========================================================================
     # STEP 1: CREATE TOKENIZED DATASET
@@ -62,6 +72,8 @@ def main():
     print("=" * 40)
     
     # Use first model for tokenization (they should all have same tokenizer)
+    # For checkpoint analysis, we'll use the base model for tokenization unless 
+    # there are tokenizer differences at different checkpoints
     dataset_path = create_tokenized_dataset(
         model_name=MODELS[0],
         n_tokens=CONFIG['n_tokens'],
@@ -85,7 +97,8 @@ def main():
             dataset_path=dataset_path,
             output_dir=CONFIG['output_dir'],
             correlation_threshold=CONFIG['correlation_threshold'],
-            min_models=CONFIG['min_models']
+            min_models=CONFIG['min_models'],
+            checkpoint_value=checkpoint_value  # Pass checkpoint parameter
         )
         
         print("✓ Analysis pipeline completed successfully!")
@@ -110,15 +123,17 @@ def main():
     # Initialize visualizer
     visualizer = UniversalNeuronVisualizer(results)
     
-    # Generate all visualizations
+    # Generate all visualizations with checkpoint-specific names
+    checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
+    
     print("Creating correlation distribution plot...")
     visualizer.plot_correlation_distribution(
-        save_path=plots_dir / 'correlation_distribution.png'
+        save_path=plots_dir / f'correlation_distribution{checkpoint_suffix}.png'
     )
     
     print("Creating universal vs regular properties comparison...")
     visualizer.plot_universal_properties_comparison(
-        save_path=plots_dir / 'properties_comparison.png'
+        save_path=plots_dir / f'properties_comparison{checkpoint_suffix}.png'
     )
     
     print("Creating correlation matrix heatmaps...")
@@ -128,16 +143,16 @@ def main():
         visualizer.plot_correlation_matrix_heatmap(
             model_pair=pair,
             layer_focus=6,  # Focus on middle layer
-            save_path=plots_dir / f'correlation_heatmap_{i}.png'
+            save_path=plots_dir / f'correlation_heatmap_{i}{checkpoint_suffix}.png'
         )
     
     print("Creating interactive dashboard...")
-    dashboard_path = plots_dir / 'dashboard.html'
+    dashboard_path = plots_dir / f'dashboard{checkpoint_suffix}.html'
     visualizer.create_analysis_dashboard(save_path=str(dashboard_path))
     
     print("Creating universal neuron network visualization...")
     visualizer.plot_universal_neuron_network(
-        save_path=str(plots_dir / 'neuron_network.html')
+        save_path=str(plots_dir / f'neuron_network{checkpoint_suffix}.html')
     )
     
     print("✓ All visualizations generated!")
@@ -152,12 +167,17 @@ def main():
     
     # Basic statistics
     n_universal = len(results['universal_neurons'])
-    total_neurons_per_model = len(results['neuron_stats'][MODELS[0]])
+    
+    # Get total neurons from first model (they should all be the same)
+    first_model_key = list(results['neuron_stats'].keys())[0]
+    total_neurons_per_model = len(results['neuron_stats'][first_model_key])
     universality_rate = n_universal / total_neurons_per_model * 100
     
     print(f"Universal neurons found: {n_universal}")
     print(f"Total neurons per model: {total_neurons_per_model}")
     print(f"Universality rate: {universality_rate:.2f}%")
+    if checkpoint_value is not None:
+        print(f"At checkpoint: {checkpoint_value}")
     
     if n_universal > 0:
         # Analyze universal neuron properties
@@ -184,7 +204,7 @@ def main():
         print(f"\nAnalyzing individual neuron properties...")
         
         # Get stats for first model as reference
-        ref_stats = results['neuron_stats'][MODELS[0]]
+        ref_stats = results['neuron_stats'][first_model_key]
         
         # Compute importance scores
         importance_scores = compute_neuron_importance_scores(ref_stats)
@@ -219,31 +239,100 @@ def main():
     print("=" * 40)
     
     print(f"✓ Analyzed {len(MODELS)} models")
+    if checkpoint_value is not None:
+        print(f"✓ At checkpoint {checkpoint_value}")
     print(f"✓ Found {n_universal} universal neurons")
     print(f"✓ Generated visualizations in {plots_dir}")
     print(f"✓ Saved detailed results in {CONFIG['output_dir']}")
     
     print(f"\nKey files generated:")
-    print(f"  - {CONFIG['output_dir']}/universal_neurons.csv")
-    print(f"  - {CONFIG['output_dir']}/universal_analysis.csv")  
-    print(f"  - {plots_dir}/dashboard.html (interactive dashboard)")
-    print(f"  - {plots_dir}/*.png (static plots)")
+    checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
+    print(f"  - {CONFIG['output_dir']}/universal_neurons{checkpoint_suffix}.csv")
+    print(f"  - {CONFIG['output_dir']}/universal_analysis{checkpoint_suffix}.csv")  
+    print(f"  - {plots_dir}/dashboard{checkpoint_suffix}.html (interactive dashboard)")
+    print(f"  - {plots_dir}/*{checkpoint_suffix}.png (static plots)")
     
     print(f"\nNext steps:")
-    print(f"  1. Open dashboard.html in browser for interactive exploration")
-    print(f"  2. Examine universal_neurons.csv for specific neuron mappings")
+    print(f"  1. Open dashboard{checkpoint_suffix}.html in browser for interactive exploration")
+    print(f"  2. Examine universal_neurons{checkpoint_suffix}.csv for specific neuron mappings")
     print(f"  3. Use the analysis results for downstream experiments")
     
     if n_universal > 0:
         print(f"  4. Consider running intervention experiments on universal neurons")
         print(f"  5. Analyze what computational roles these neurons serve")
     
+    if checkpoint_value is not None:
+        print(f"  6. Compare results across different checkpoints to study evolution")
+    
     return True
 
-def quick_test():
+def compare_checkpoints(checkpoint_list, base_config=None):
+    """Run analysis across multiple checkpoints for comparison"""
+    
+    print("=" * 60)
+    print("MULTI-CHECKPOINT COMPARISON ANALYSIS")
+    print("=" * 60)
+    
+    results_by_checkpoint = {}
+    
+    for checkpoint in checkpoint_list:
+        print(f"\n{'='*20} CHECKPOINT {checkpoint} {'='*20}")
+        success = main(checkpoint_value=checkpoint)
+        if success:
+            # Load results for comparison
+            results_dir = f"universal_neurons_results_checkpoint_{checkpoint}"
+            try:
+                results = load_analysis_results(results_dir)
+                results_by_checkpoint[checkpoint] = results
+                print(f"✓ Checkpoint {checkpoint} completed")
+            except Exception as e:
+                print(f"✗ Failed to load results for checkpoint {checkpoint}: {e}")
+        else:
+            print(f"✗ Analysis failed for checkpoint {checkpoint}")
+    
+    # Generate comparison report
+    if len(results_by_checkpoint) > 1:
+        print("\n" + "=" * 60)
+        print("CHECKPOINT COMPARISON SUMMARY")
+        print("=" * 60)
+        
+        comparison_data = []
+        for checkpoint, results in results_by_checkpoint.items():
+            if 'universal_neurons' in results:
+                n_universal = len(results['universal_neurons'])
+                if n_universal > 0:
+                    mean_corr = results['universal_neurons']['mean_correlation'].mean()
+                else:
+                    mean_corr = 0.0
+            else:
+                n_universal = 0
+                mean_corr = 0.0
+            
+            comparison_data.append({
+                'checkpoint': checkpoint,
+                'universal_neurons': n_universal,
+                'mean_correlation': mean_corr
+            })
+        
+        print("Checkpoint | Universal Neurons | Mean Correlation")
+        print("-" * 50)
+        for data in comparison_data:
+            print(f"{data['checkpoint']:^10} | {data['universal_neurons']:^17} | {data['mean_correlation']:.3f}")
+        
+        # Save comparison
+        import pandas as pd
+        comparison_df = pd.DataFrame(comparison_data)
+        comparison_df.to_csv("checkpoint_comparison.csv", index=False)
+        print(f"\n✓ Comparison saved to checkpoint_comparison.csv")
+    
+    return results_by_checkpoint
+
+def quick_test(checkpoint_value: Optional[Union[int, str]] = None):
     """Run a quick test with smaller models and less data"""
     
     print("Running quick test with smaller models...")
+    if checkpoint_value is not None:
+        print(f"Testing checkpoint: {checkpoint_value}")
     
     # Use just GPT2 variants for quick testing
     test_models = ["gpt2", "distilgpt2"]
@@ -257,35 +346,79 @@ def quick_test():
     )
     
     # Run with relaxed parameters
+    output_dir = "test_results"
+    if checkpoint_value is not None:
+        output_dir = f"{output_dir}_checkpoint_{checkpoint_value}"
+    
     results = run_universal_neurons_analysis(
         model_names=test_models,
         dataset_path=dataset_path,
-        output_dir="test_results",
+        output_dir=output_dir,
         correlation_threshold=0.4,  # Lower threshold
-        min_models=2
+        min_models=2,
+        checkpoint_value=checkpoint_value
     )
     
     # Quick visualization
     visualizer = UniversalNeuronVisualizer(results)
-    visualizer.create_analysis_dashboard("test_dashboard.html")
+    checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
+    visualizer.create_analysis_dashboard(f"test_dashboard{checkpoint_suffix}.html")
     
-    print("Quick test completed! Check test_dashboard.html")
+    print(f"Quick test completed! Check test_dashboard{checkpoint_suffix}.html")
     return results
 
 if __name__ == "__main__":
     
-    # Check command line arguments
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+    parser = argparse.ArgumentParser(description="Universal Neurons Analysis with Checkpoint Support")
+    parser.add_argument("--test", action="store_true", help="Run quick test with smaller models")
+    parser.add_argument("--checkpoint", type=str, default=None, 
+                       help="Specific checkpoint to analyze (e.g., '1000', 'step_5000')")
+    parser.add_argument("--compare-checkpoints", nargs="+", type=str, default=None,
+                       help="List of checkpoints to compare (e.g., --compare-checkpoints 1000 2000 5000)")
+    
+    args = parser.parse_args()
+    
+    if args.compare_checkpoints:
+        print("Running multi-checkpoint comparison...")
+        checkpoint_list = args.compare_checkpoints
+        # Convert to integers if they're numeric
+        processed_checkpoints = []
+        for cp in checkpoint_list:
+            try:
+                processed_checkpoints.append(int(cp))
+            except ValueError:
+                processed_checkpoints.append(cp)  # Keep as string if not numeric
+        
+        results_by_checkpoint = compare_checkpoints(processed_checkpoints)
+        
+    elif args.test:
         print("Running in test mode...")
-        quick_test()
+        checkpoint = None
+        if args.checkpoint:
+            try:
+                checkpoint = int(args.checkpoint)
+            except ValueError:
+                checkpoint = args.checkpoint
+        quick_test(checkpoint_value=checkpoint)
+        
     else:
         print("Running full analysis...")
-        print("(Use --test flag for quick test with smaller models)")
-        success = main()
+        checkpoint = None
+        if args.checkpoint:
+            try:
+                checkpoint = int(args.checkpoint)
+            except ValueError:
+                checkpoint = args.checkpoint
+            print(f"Analyzing checkpoint: {checkpoint}")
+        else:
+            print("No checkpoint specified - analyzing final trained models")
+        
+        success = main(checkpoint_value=checkpoint)
         
         if success:
             print("\n🎉 Analysis completed successfully!")
-            print("Check the generated dashboard.html file for interactive results!")
+            checkpoint_suffix = f"_checkpoint_{checkpoint}" if checkpoint else ""
+            print(f"Check the generated dashboard{checkpoint_suffix}.html file for interactive results!")
         else:
-            print("\n❌ Analysis failed. Check error messages above.")
+            print("\n⚠ Analysis failed. Check error messages above.")
             sys.exit(1)

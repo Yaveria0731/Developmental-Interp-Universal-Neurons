@@ -1,6 +1,6 @@
 """
-Dataset Creation and Additional Analysis Utilities
-Supporting utilities for the universal neurons analysis
+Dataset Creation and Additional Analysis Utilities - Modified for Checkpoint Support
+Supporting utilities for the universal neurons analysis across training checkpoints
 """
 
 import os
@@ -10,14 +10,14 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from transformer_lens import HookedTransformer
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ============================================================================
-# DATASET CREATION
+# DATASET CREATION (UNCHANGED)
 # ============================================================================
 
 def create_tokenized_dataset(
@@ -105,17 +105,22 @@ def create_tokenized_dataset(
     return save_path
 
 # ============================================================================
-# VISUALIZATION UTILITIES  
+# VISUALIZATION UTILITIES (MODIFIED FOR CHECKPOINT SUPPORT)
 # ============================================================================
 
 class UniversalNeuronVisualizer:
-    """Visualization utilities for universal neuron analysis"""
+    """Visualization utilities for universal neuron analysis with checkpoint support"""
     
     def __init__(self, results: Dict):
         self.neuron_stats = results['neuron_stats']
         self.correlations = results['correlations']
         self.universal_neurons = results['universal_neurons']
         self.analysis = results['analysis']
+        self.checkpoint = results.get('checkpoint', None)
+    
+    def _get_title_suffix(self) -> str:
+        """Get title suffix for checkpoint-specific plots"""
+        return f" (Checkpoint {self.checkpoint})" if self.checkpoint is not None else ""
     
     def plot_correlation_distribution(self, save_path: Optional[str] = None):
         """Plot distribution of correlation values"""
@@ -133,7 +138,11 @@ class UniversalNeuronVisualizer:
         plt.axvline(0.5, color='red', linestyle='--', label='Universal threshold')
         plt.xlabel('Pearson Correlation')
         plt.ylabel('Density')
-        plt.title('Distribution of Inter-Model Neuron Correlations')
+        
+        title = 'Distribution of Inter-Model Neuron Correlations'
+        title += self._get_title_suffix()
+        plt.title(title)
+        
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -190,6 +199,10 @@ class UniversalNeuronVisualizer:
         for i in range(len(available_props), len(axes)):
             fig.delaxes(axes[i])
         
+        title = 'Universal vs Regular Neuron Properties'
+        title += self._get_title_suffix()
+        fig.suptitle(title, fontsize=16)
+        
         plt.tight_layout()
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -215,6 +228,8 @@ class UniversalNeuronVisualizer:
             n_layers = corr_matrix.shape[0]
             corr_data = torch.stack([corr_matrix[i, :, i, :] for i in range(n_layers)]).mean(0).numpy()
             title = f'Average Neuron Correlations: {model_pair[0]} vs {model_pair[1]}'
+        
+        title += self._get_title_suffix()
         
         plt.figure(figsize=(12, 10))
         sns.heatmap(corr_data, cmap='RdBu_r', center=0, 
@@ -273,8 +288,11 @@ class UniversalNeuronVisualizer:
                 marker=dict(size=8)
             ))
         
+        title = 'Universal Neuron Connection Network'
+        title += self._get_title_suffix()
+        
         fig.update_layout(
-            title='Universal Neuron Connection Network',
+            title=title,
             xaxis_title='Models',
             showlegend=False,
             height=600
@@ -340,9 +358,12 @@ class UniversalNeuronVisualizer:
             row=2, col=2
         )
         
+        title = "Universal Neurons Analysis Dashboard"
+        title += self._get_title_suffix()
+        
         fig.update_layout(
             height=800,
-            title_text="Universal Neurons Analysis Dashboard",
+            title_text=title,
             showlegend=False
         )
         
@@ -351,7 +372,182 @@ class UniversalNeuronVisualizer:
         return fig
 
 # ============================================================================
-# ANALYSIS UTILITIES
+# CHECKPOINT COMPARISON UTILITIES (NEW)
+# ============================================================================
+
+class CheckpointComparisonVisualizer:
+    """Visualize comparisons across different training checkpoints"""
+    
+    def __init__(self, results_by_checkpoint: Dict[Union[int, str], Dict]):
+        self.results_by_checkpoint = results_by_checkpoint
+        self.checkpoints = sorted(results_by_checkpoint.keys())
+    
+    def plot_universality_evolution(self, save_path: Optional[str] = None):
+        """Plot how universality evolves across checkpoints"""
+        
+        checkpoint_data = []
+        for checkpoint in self.checkpoints:
+            results = self.results_by_checkpoint[checkpoint]
+            n_universal = len(results.get('universal_neurons', []))
+            
+            if n_universal > 0:
+                mean_correlation = results['universal_neurons']['mean_correlation'].mean()
+            else:
+                mean_correlation = 0.0
+            
+            checkpoint_data.append({
+                'checkpoint': checkpoint,
+                'n_universal': n_universal,
+                'mean_correlation': mean_correlation
+            })
+        
+        df = pd.DataFrame(checkpoint_data)
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # Plot number of universal neurons
+        ax1.plot(df['checkpoint'], df['n_universal'], 'o-', linewidth=2, markersize=8)
+        ax1.set_xlabel('Training Checkpoint')
+        ax1.set_ylabel('Number of Universal Neurons')
+        ax1.set_title('Universal Neuron Count vs Training Progress')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot mean correlation strength
+        ax2.plot(df['checkpoint'], df['mean_correlation'], 'o-', linewidth=2, markersize=8, color='orange')
+        ax2.set_xlabel('Training Checkpoint')
+        ax2.set_ylabel('Mean Correlation Strength')
+        ax2.set_title('Universal Correlation Strength vs Training Progress')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return df
+    
+    def plot_layer_distribution_evolution(self, save_path: Optional[str] = None):
+        """Plot how universal neuron distribution across layers evolves"""
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
+        
+        for i, checkpoint in enumerate(self.checkpoints[:6]):  # Show first 6 checkpoints
+            if i >= len(axes):
+                break
+                
+            results = self.results_by_checkpoint[checkpoint]
+            if 'universal_neurons' in results and len(results['universal_neurons']) > 0:
+                layer_dist = results['universal_neurons']['reference_layer'].value_counts().sort_index()
+                
+                ax = axes[i]
+                ax.bar(layer_dist.index, layer_dist.values)
+                ax.set_title(f'Checkpoint {checkpoint}')
+                ax.set_xlabel('Layer')
+                ax.set_ylabel('Universal Neurons')
+                ax.grid(True, alpha=0.3)
+        
+        # Remove empty subplots
+        for i in range(len(self.checkpoints), len(axes)):
+            fig.delaxes(axes[i])
+        
+        plt.suptitle('Universal Neuron Layer Distribution Evolution', fontsize=16)
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    def create_checkpoint_comparison_dashboard(self, save_path: str = "checkpoint_comparison_dashboard.html"):
+        """Create interactive dashboard comparing across checkpoints"""
+        
+        # Prepare data
+        evolution_data = []
+        for checkpoint in self.checkpoints:
+            results = self.results_by_checkpoint[checkpoint]
+            n_universal = len(results.get('universal_neurons', []))
+            
+            if n_universal > 0:
+                mean_correlation = results['universal_neurons']['mean_correlation'].mean()
+                # Get layer distribution
+                layer_dist = results['universal_neurons']['reference_layer'].value_counts().sort_index()
+            else:
+                mean_correlation = 0.0
+                layer_dist = pd.Series()
+            
+            evolution_data.append({
+                'checkpoint': checkpoint,
+                'n_universal': n_universal,
+                'mean_correlation': mean_correlation,
+                'layer_distribution': layer_dist.to_dict() if len(layer_dist) > 0 else {}
+            })
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=[
+                'Universal Neuron Count Evolution',
+                'Correlation Strength Evolution', 
+                'Layer Distribution (Latest Checkpoint)',
+                'Checkpoint Comparison Summary'
+            ]
+        )
+        
+        # 1. Universal neuron count evolution
+        checkpoints = [d['checkpoint'] for d in evolution_data]
+        n_universal_counts = [d['n_universal'] for d in evolution_data]
+        
+        fig.add_trace(
+            go.Scatter(x=checkpoints, y=n_universal_counts, 
+                      mode='lines+markers', name='Universal Count'),
+            row=1, col=1
+        )
+        
+        # 2. Correlation strength evolution
+        mean_correlations = [d['mean_correlation'] for d in evolution_data]
+        
+        fig.add_trace(
+            go.Scatter(x=checkpoints, y=mean_correlations,
+                      mode='lines+markers', name='Mean Correlation'),
+            row=1, col=2
+        )
+        
+        # 3. Layer distribution for latest checkpoint
+        if evolution_data and evolution_data[-1]['layer_distribution']:
+            latest_layers = evolution_data[-1]['layer_distribution']
+            fig.add_trace(
+                go.Bar(x=list(latest_layers.keys()), y=list(latest_layers.values()),
+                      name='Layer Distribution'),
+                row=2, col=1
+            )
+        
+        # 4. Summary heatmap
+        summary_matrix = []
+        checkpoint_labels = []
+        for data in evolution_data:
+            summary_matrix.append([data['n_universal'], data['mean_correlation']])
+            checkpoint_labels.append(str(data['checkpoint']))
+        
+        if summary_matrix:
+            fig.add_trace(
+                go.Heatmap(z=np.array(summary_matrix).T,
+                          x=checkpoint_labels,
+                          y=['Universal Count', 'Mean Correlation'],
+                          colorscale='Viridis'),
+                row=2, col=2
+            )
+        
+        fig.update_layout(
+            height=800,
+            title_text="Checkpoint Comparison Dashboard",
+            showlegend=False
+        )
+        
+        fig.write_html(save_path)
+        print(f"Checkpoint comparison dashboard saved to {save_path}")
+        return fig
+
+# ============================================================================
+# ANALYSIS UTILITIES (MODIFIED TO HANDLE CHECKPOINT FILENAMES)
 # ============================================================================
 
 def load_analysis_results(results_dir: str) -> Dict:
@@ -363,26 +559,47 @@ def load_analysis_results(results_dir: str) -> Dict:
     neuron_stats = {}
     for file in os.listdir(results_dir):
         if file.endswith('_neuron_stats.csv'):
-            model_name = file.replace('_neuron_stats.csv', '').replace('_', '/')
+            # Extract model name, handling checkpoint suffixes
+            model_name = file.replace('_neuron_stats.csv', '')
+            if '_checkpoint_' in model_name:
+                # Keep the full identifier including checkpoint
+                pass
+            else:
+                model_name = model_name.replace('_', '/')
+            
             stats_df = pd.read_csv(os.path.join(results_dir, file), index_col=[0, 1])
             neuron_stats[model_name] = stats_df
     
     results['neuron_stats'] = neuron_stats
     
     # Load correlations
-    corr_file = os.path.join(results_dir, 'correlations.pt')
-    if os.path.exists(corr_file):
-        results['correlations'] = torch.load(corr_file)
+    for file in os.listdir(results_dir):
+        if file.startswith('correlations') and file.endswith('.pt'):
+            corr_file = os.path.join(results_dir, file)
+            results['correlations'] = torch.load(corr_file)
+            break
     
     # Load universal neurons
-    universal_file = os.path.join(results_dir, 'universal_neurons.csv')
-    if os.path.exists(universal_file):
-        results['universal_neurons'] = pd.read_csv(universal_file)
+    for file in os.listdir(results_dir):
+        if file.startswith('universal_neurons') and file.endswith('.csv'):
+            universal_file = os.path.join(results_dir, file)
+            results['universal_neurons'] = pd.read_csv(universal_file)
+            break
     
     # Load analysis
-    analysis_file = os.path.join(results_dir, 'universal_analysis.csv')
-    if os.path.exists(analysis_file):
-        results['analysis'] = pd.read_csv(analysis_file)
+    for file in os.listdir(results_dir):
+        if file.startswith('universal_analysis') and file.endswith('.csv'):
+            analysis_file = os.path.join(results_dir, file)
+            results['analysis'] = pd.read_csv(analysis_file)
+            break
+    
+    # Try to extract checkpoint info from directory name
+    if '_checkpoint_' in results_dir:
+        checkpoint_part = results_dir.split('_checkpoint_')[-1]
+        try:
+            results['checkpoint'] = int(checkpoint_part)
+        except ValueError:
+            results['checkpoint'] = checkpoint_part
     
     return results
 
@@ -463,13 +680,110 @@ def compute_neuron_importance_scores(neuron_stats: pd.DataFrame) -> pd.DataFrame
     return importance_scores.sort_values('importance_score', ascending=False)
 
 # ============================================================================
-# EXAMPLE USAGE AND TESTING
+# CHECKPOINT ANALYSIS UTILITIES (NEW)
 # ============================================================================
 
-def run_quick_test():
+def analyze_checkpoint_progression(results_by_checkpoint: Dict[Union[int, str], Dict]) -> pd.DataFrame:
+    """Analyze how universal neurons change across checkpoints"""
+    
+    progression_data = []
+    
+    for checkpoint, results in results_by_checkpoint.items():
+        universal_neurons = results.get('universal_neurons', pd.DataFrame())
+        
+        if len(universal_neurons) > 0:
+            # Basic statistics
+            n_universal = len(universal_neurons)
+            mean_correlation = universal_neurons['mean_correlation'].mean()
+            max_correlation = universal_neurons['mean_correlation'].max()
+            
+            # Layer distribution entropy (measure of how spread across layers)
+            layer_counts = universal_neurons['reference_layer'].value_counts()
+            layer_probs = layer_counts / layer_counts.sum()
+            layer_entropy = -np.sum(layer_probs * np.log2(layer_probs + 1e-8))
+            
+            # Stability (how many neurons remain from previous checkpoint)
+            stability = 0.0
+            if len(progression_data) > 0:
+                prev_neurons = set()
+                for _, row in results_by_checkpoint[progression_data[-1]['checkpoint']]['universal_neurons'].iterrows():
+                    prev_neurons.add((row['reference_layer'], row['reference_neuron']))
+                
+                curr_neurons = set()
+                for _, row in universal_neurons.iterrows():
+                    curr_neurons.add((row['reference_layer'], row['reference_neuron']))
+                
+                if len(prev_neurons) > 0:
+                    stability = len(prev_neurons & curr_neurons) / len(prev_neurons)
+            
+        else:
+            n_universal = 0
+            mean_correlation = 0.0
+            max_correlation = 0.0
+            layer_entropy = 0.0
+            stability = 0.0
+        
+        progression_data.append({
+            'checkpoint': checkpoint,
+            'n_universal': n_universal,
+            'mean_correlation': mean_correlation,
+            'max_correlation': max_correlation,
+            'layer_entropy': layer_entropy,
+            'stability': stability
+        })
+    
+    return pd.DataFrame(progression_data).sort_values('checkpoint')
+
+def find_persistent_universal_neurons(results_by_checkpoint: Dict[Union[int, str], Dict], 
+                                    min_checkpoints: int = 2) -> pd.DataFrame:
+    """Find neurons that remain universal across multiple checkpoints"""
+    
+    neuron_appearances = {}
+    
+    for checkpoint, results in results_by_checkpoint.items():
+        universal_neurons = results.get('universal_neurons', pd.DataFrame())
+        
+        for _, row in universal_neurons.iterrows():
+            neuron_id = (row['reference_layer'], row['reference_neuron'])
+            
+            if neuron_id not in neuron_appearances:
+                neuron_appearances[neuron_id] = []
+            
+            neuron_appearances[neuron_id].append({
+                'checkpoint': checkpoint,
+                'mean_correlation': row['mean_correlation'],
+                'n_models': row['n_models']
+            })
+    
+    # Filter for persistent neurons
+    persistent_neurons = []
+    for neuron_id, appearances in neuron_appearances.items():
+        if len(appearances) >= min_checkpoints:
+            layer, neuron = neuron_id
+            checkpoints_present = [app['checkpoint'] for app in appearances]
+            mean_correlations = [app['mean_correlation'] for app in appearances]
+            
+            persistent_neurons.append({
+                'layer': layer,
+                'neuron': neuron,
+                'checkpoints_present': checkpoints_present,
+                'n_checkpoints': len(appearances),
+                'mean_correlation_across_checkpoints': np.mean(mean_correlations),
+                'correlation_stability': np.std(mean_correlations)
+            })
+    
+    return pd.DataFrame(persistent_neurons).sort_values('n_checkpoints', ascending=False)
+
+# ============================================================================
+# EXAMPLE USAGE AND TESTING (MODIFIED)
+# ============================================================================
+
+def run_quick_test(checkpoint_value: Optional[Union[int, str]] = None):
     """Run a quick test with a subset of models and data"""
     
     print("Running quick test of universal neuron analysis...")
+    if checkpoint_value is not None:
+        print(f"Testing checkpoint: {checkpoint_value}")
     
     # Use smaller models for testing
     test_models = [
@@ -488,20 +802,27 @@ def run_quick_test():
     # Run analysis
     from universal_neurons_pipeline import run_universal_neurons_analysis
     
+    output_dir = "test_results"
+    if checkpoint_value is not None:
+        output_dir = f"{output_dir}_checkpoint_{checkpoint_value}"
+    
     results = run_universal_neurons_analysis(
         model_names=test_models,
         dataset_path=dataset_path,
-        output_dir="test_results",
+        output_dir=output_dir,
         correlation_threshold=0.3,  # Lower threshold for testing
-        min_models=2
+        min_models=2,
+        checkpoint_value=checkpoint_value
     )
     
     # Create visualizations
     visualizer = UniversalNeuronVisualizer(results)
     visualizer.plot_correlation_distribution()
-    visualizer.create_analysis_dashboard("test_dashboard.html")
     
-    print("Test completed! Check test_results/ directory for outputs.")
+    checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
+    visualizer.create_analysis_dashboard(f"test_dashboard{checkpoint_suffix}.html")
+    
+    print(f"Test completed! Check test_dashboard{checkpoint_suffix}.html")
     return results
 
 if __name__ == "__main__":
@@ -516,4 +837,4 @@ if __name__ == "__main__":
     )
     
     print(f"Dataset created at: {dataset_path}")
-    print("You can now run the main analysis pipeline!")
+    print("You can now run the main analysis pipeline with checkpoint support!")
