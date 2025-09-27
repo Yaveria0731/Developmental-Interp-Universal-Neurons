@@ -1,6 +1,6 @@
 """
-Universal Neurons Analysis Pipeline - Modified for Checkpoint Support with Disk-based Correlation Storage
-Streamlined version for replicating the universal neurons experiment across training checkpoints
+Universal Neurons Analysis Pipeline - Modified for Checkpoint Support with File-based Resumption
+Streamlined version that skips computation when output files already exist
 """
 
 import os
@@ -15,9 +15,10 @@ from torch.utils.data import DataLoader
 import einops
 from functools import partial
 from tqdm import tqdm
+import glob
 
 # ============================================================================
-# 1. NEURON STATISTICS GENERATION (UNCHANGED)
+# 1. NEURON STATISTICS GENERATION (MODIFIED WITH FILE CHECKS)
 # ============================================================================
 
 class NeuronStatsGenerator:
@@ -27,29 +28,53 @@ class NeuronStatsGenerator:
         self.model_name = model_name
         self.device = device
         self.checkpoint_value = checkpoint_value
-        
-        # Load model with checkpoint if specified
-        if checkpoint_value is not None:
-            self.model = HookedTransformer.from_pretrained(
-                model_name, 
-                device=device, 
-                checkpoint_value=checkpoint_value
-            )
-            self.model_identifier = f"{model_name}_checkpoint_{checkpoint_value}"
+        self.model = None  # Lazy loading
+        self.model_identifier = None
+    
+    def _load_model_if_needed(self):
+        """Load model only when needed"""
+        if self.model is None:
+            # Load model with checkpoint if specified
+            if self.checkpoint_value is not None:
+                self.model = HookedTransformer.from_pretrained(
+                    self.model_name, 
+                    device=self.device, 
+                    checkpoint_value=self.checkpoint_value
+                )
+                self.model_identifier = f"{self.model_name}_checkpoint_{self.checkpoint_value}"
+            else:
+                self.model = HookedTransformer.from_pretrained(self.model_name, device=self.device)
+                self.model_identifier = self.model_name
+                
+            self.model.eval()
+            torch.set_grad_enabled(False)
+    
+    def get_expected_filename(self, output_dir: str) -> str:
+        """Get the expected filename for this model's stats"""
+        safe_model_name = self.model_name.replace('/', '_')
+        if self.checkpoint_value is not None:
+            filename = f"{safe_model_name}_checkpoint_{self.checkpoint_value}_neuron_stats.csv"
         else:
-            self.model = HookedTransformer.from_pretrained(model_name, device=device)
-            self.model_identifier = model_name
-            
-        self.model.eval()
-        torch.set_grad_enabled(False)
+            filename = f"{safe_model_name}_neuron_stats.csv"
+        return os.path.join(output_dir, filename)
+    
+    def stats_file_exists(self, output_dir: str) -> bool:
+        """Check if stats file already exists"""
+        return os.path.exists(self.get_expected_filename(output_dir))
+    
+    def load_existing_stats(self, output_dir: str) -> pd.DataFrame:
+        """Load existing stats file"""
+        filepath = self.get_expected_filename(output_dir)
+        return pd.read_csv(filepath, index_col=[0, 1])
     
     def get_model_device(self):
         """Get the actual device of the model parameters"""
+        self._load_model_if_needed()
         return next(self.model.parameters()).device
     
     def compute_weight_statistics(self) -> pd.DataFrame:
         """Compute weight-based statistics for all neurons"""
-        # Use the actual device of model parameters
+        self._load_model_if_needed()
         device = self.get_model_device()
         
         # Get weight matrices
@@ -86,6 +111,7 @@ class NeuronStatsGenerator:
     
     def compute_vocab_composition_stats(self) -> pd.DataFrame:
         """Compute vocabulary composition statistics"""
+        self._load_model_if_needed()
         device = self.get_model_device()
         
         # Normalize embeddings
@@ -127,7 +153,7 @@ class NeuronStatsGenerator:
     def compute_activation_statistics(self, dataset_path: str, 
                                     batch_size: int = 32) -> pd.DataFrame:
         """Compute activation-based statistics on a dataset"""
-        
+        self._load_model_if_needed()
         device = self.get_model_device()
         
         # Load tokenized dataset
@@ -219,8 +245,16 @@ class NeuronStatsGenerator:
         
         return activation_df
     
-    def generate_full_neuron_dataframe(self, dataset_path: Optional[str] = None) -> pd.DataFrame:
+    def generate_full_neuron_dataframe(self, dataset_path: Optional[str] = None, 
+                                     output_dir: Optional[str] = None) -> pd.DataFrame:
         """Generate complete neuron statistics dataframe"""
+        # If model not loaded yet, we need the identifier for logging
+        if self.model_identifier is None:
+            if self.checkpoint_value is not None:
+                self.model_identifier = f"{self.model_name}_checkpoint_{self.checkpoint_value}"
+            else:
+                self.model_identifier = self.model_name
+        
         print(f"Generating neuron statistics for {self.model_identifier}")
         
         # Compute weight statistics
@@ -245,38 +279,70 @@ class NeuronStatsGenerator:
         if self.checkpoint_value is not None:
             full_stats['checkpoint'] = self.checkpoint_value
         
+        # Save immediately if output directory provided
+        if output_dir:
+            filepath = self.get_expected_filename(output_dir)
+            full_stats.to_csv(filepath)
+            print(f"Saved stats to {filepath}")
+        
         return full_stats
 
 # ============================================================================
-# 2. CORRELATION COMPUTATION (MODIFIED FOR DISK STORAGE)
+# 2. CORRELATION COMPUTATION (MODIFIED WITH FILE CHECKS)
 # ============================================================================
 
 class NeuronCorrelationComputer:
-    """Compute correlations between neurons across different models - with disk-based storage"""
+    """Compute correlations between neurons across different models - with file-based checkpointing"""
     
     def __init__(self, model_names: List[str], device: str = "cuda", checkpoint_value: Optional[Union[int, str]] = None):
         self.model_names = model_names
-        self.requested_device = device  # Store requested device
+        self.requested_device = device
         self.checkpoint_value = checkpoint_value
-        self.models = {}
-        
-        print("Loading models...")
-        for name in model_names:
-            print(f"Loading {name}...")
-            if checkpoint_value is not None:
+        self.models = {}  # Lazy loading
+    
+    def _get_model_identifier(self, model_name: str) -> str:
+        """Get model identifier including checkpoint info"""
+        if self.checkpoint_value is not None:
+            return f"{model_name}_checkpoint_{self.checkpoint_value}"
+        else:
+            return model_name
+    
+    def _load_model(self, model_name: str):
+        """Load a single model"""
+        model_id = self._get_model_identifier(model_name)
+        if model_id not in self.models:
+            print(f"Loading {model_name}...")
+            if self.checkpoint_value is not None:
                 model = HookedTransformer.from_pretrained(
-                    name, 
-                    device=device, 
-                    checkpoint_value=checkpoint_value
+                    model_name, 
+                    device=self.requested_device, 
+                    checkpoint_value=self.checkpoint_value
                 )
-                model_id = f"{name}_checkpoint_{checkpoint_value}"
             else:
-                model = HookedTransformer.from_pretrained(name, device=device)
-                model_id = name
-                
+                model = HookedTransformer.from_pretrained(model_name, device=self.requested_device)
+            
             model.eval()
             self.models[model_id] = model
-        torch.set_grad_enabled(False)
+            torch.set_grad_enabled(False)
+    
+    def get_expected_correlation_filename(self, model1_name: str, model2_name: str, output_dir: str) -> str:
+        """Get expected filename for correlation between two models"""
+        model1_id = self._get_model_identifier(model1_name)
+        model2_id = self._get_model_identifier(model2_name)
+        
+        safe_model1 = model1_id.replace('/', '_').replace('-', '_')
+        safe_model2 = model2_id.replace('/', '_').replace('-', '_')
+        
+        if self.checkpoint_value is not None:
+            filename = f"correlation_{safe_model1}_vs_{safe_model2}_checkpoint_{self.checkpoint_value}.pt"
+        else:
+            filename = f"correlation_{safe_model1}_vs_{safe_model2}.pt"
+        
+        return os.path.join(output_dir, filename)
+    
+    def correlation_file_exists(self, model1_name: str, model2_name: str, output_dir: str) -> bool:
+        """Check if correlation file already exists"""
+        return os.path.exists(self.get_expected_correlation_filename(model1_name, model2_name, output_dir))
     
     def get_model_device(self, model):
         """Get the actual device of model parameters"""
@@ -309,9 +375,22 @@ class NeuronCorrelationComputer:
         
         return activations
     
-    def compute_pairwise_correlation(self, model1_id: str, model2_id: str,
+    def compute_pairwise_correlation(self, model1_name: str, model2_name: str,
                                dataset_path: str, output_dir: str, batch_size: int = 32) -> str:
         """Compute Pearson correlation between all neuron pairs and save to disk immediately"""
+        
+        # Check if file already exists
+        expected_file = self.get_expected_correlation_filename(model1_name, model2_name, output_dir)
+        if os.path.exists(expected_file):
+            print(f"Correlation file already exists: {os.path.basename(expected_file)} - skipping computation")
+            return expected_file
+        
+        # Load models only if computation is needed
+        self._load_model(model1_name)
+        self._load_model(model2_name)
+        
+        model1_id = self._get_model_identifier(model1_name)
+        model2_id = self._get_model_identifier(model2_name)
         
         model1 = self.models[model1_id]
         model2 = self.models[model2_id]
@@ -322,7 +401,7 @@ class NeuronCorrelationComputer:
         
         # Use GPU for all computation
         compute_device = device1 if torch.cuda.is_available() else 'cpu'
-        print(f"Using device: {compute_device}")
+        print(f"Computing correlation between {model1_name} and {model2_name} on {compute_device}")
         
         # Load dataset
         tokenized_dataset = datasets.load_from_disk(dataset_path)
@@ -370,7 +449,6 @@ class NeuronCorrelationComputer:
         print(f"Cross-correlation tensor shape: {cross_sum.shape}")
         print(f"Estimated GPU memory usage: {cross_sum.numel() * 8 / (1024**3):.1f} GB")
         
-        print(f"Computing correlation between {model1_id} and {model2_id}")
         for batch in tqdm(dataloader):
             # Keep original batch for consistent masking
             original_batch = batch.clone()
@@ -441,37 +519,25 @@ class NeuronCorrelationComputer:
                 
                 correlations[l1, :, l2, :] = numerator / denominator
         
-        # Generate filename for this correlation pair
-        safe_model1 = model1_id.replace('/', '_').replace('-', '_')
-        safe_model2 = model2_id.replace('/', '_').replace('-', '_')
-        
-        if self.checkpoint_value is not None:
-            corr_filename = f"correlation_{safe_model1}_vs_{safe_model2}_checkpoint_{self.checkpoint_value}.pt"
-        else:
-            corr_filename = f"correlation_{safe_model1}_vs_{safe_model2}.pt"
-        
-        corr_filepath = os.path.join(output_dir, corr_filename)
-        
         # Save immediately to disk and free GPU memory
-        print(f"Saving correlation to {corr_filepath}...")
+        print(f"Saving correlation to {expected_file}...")
         torch.save({
             'correlation_matrix': correlations.cpu(),
             'model1': model1_id,
             'model2': model2_id,
             'n_samples': n_samples,
             'checkpoint': self.checkpoint_value
-        }, corr_filepath)
+        }, expected_file)
         
-        print(f"Correlation computation and save complete for {model1_id} vs {model2_id}")
-        return corr_filepath
+        print(f"Correlation computation and save complete for {model1_name} vs {model2_name}")
+        return expected_file
     
     def compute_all_correlations(self, dataset_path: str, output_dir: str) -> List[str]:
         """Compute correlations between all model pairs and save each to disk immediately"""
         correlation_files = []
-        model_ids = list(self.models.keys())
         
-        for i, model1 in enumerate(model_ids):
-            for j, model2 in enumerate(model_ids[i:], i):
+        for i, model1 in enumerate(self.model_names):
+            for j, model2 in enumerate(self.model_names[i:], i):
                 if i == j:
                     continue  # Skip self-correlation
                 
@@ -618,7 +684,121 @@ class UniversalNeuronAnalyzer:
         return pd.DataFrame(analysis_results)
 
 # ============================================================================
-# 4. MAIN PIPELINE (MODIFIED)
+# 4. FILE MANAGEMENT UTILITIES (NEW)
+# ============================================================================
+
+def check_existing_files(model_names: List[str], output_dir: str, checkpoint_value: Optional[Union[int, str]] = None) -> Dict[str, Dict]:
+    """Check which files already exist and what still needs to be computed"""
+    
+    status = {
+        'neuron_stats': {},
+        'correlations': {},
+        'universal_analysis': {},
+        'needs_computation': {
+            'neuron_stats': [],
+            'correlations': [],
+            'universal_analysis': False
+        }
+    }
+    
+    # Check neuron stats files
+    print("Checking existing neuron statistics files...")
+    for model_name in model_names:
+        generator = NeuronStatsGenerator(model_name, checkpoint_value=checkpoint_value)
+        if generator.stats_file_exists(output_dir):
+            status['neuron_stats'][model_name] = {
+                'exists': True,
+                'path': generator.get_expected_filename(output_dir)
+            }
+            print(f"  ✓ Found: {os.path.basename(generator.get_expected_filename(output_dir))}")
+        else:
+            status['neuron_stats'][model_name] = {'exists': False}
+            status['needs_computation']['neuron_stats'].append(model_name)
+            print(f"  ✗ Missing: {os.path.basename(generator.get_expected_filename(output_dir))}")
+    
+    # Check correlation files
+    print("\nChecking existing correlation files...")
+    correlator = NeuronCorrelationComputer(model_names, checkpoint_value=checkpoint_value)
+    existing_correlation_files = []
+    
+    for i, model1 in enumerate(model_names):
+        for j, model2 in enumerate(model_names[i:], i):
+            if i == j:
+                continue
+            
+            if correlator.correlation_file_exists(model1, model2, output_dir):
+                corr_file = correlator.get_expected_correlation_filename(model1, model2, output_dir)
+                status['correlations'][(model1, model2)] = {
+                    'exists': True,
+                    'path': corr_file
+                }
+                existing_correlation_files.append(corr_file)
+                print(f"  ✓ Found: {os.path.basename(corr_file)}")
+            else:
+                status['correlations'][(model1, model2)] = {'exists': False}
+                status['needs_computation']['correlations'].append((model1, model2))
+                expected_file = correlator.get_expected_correlation_filename(model1, model2, output_dir)
+                print(f"  ✗ Missing: {os.path.basename(expected_file)}")
+    
+    # Check universal analysis files
+    print("\nChecking universal analysis files...")
+    universal_filename = "universal_neurons.csv"
+    analysis_filename = "universal_analysis.csv"
+    if checkpoint_value is not None:
+        universal_filename = f"universal_neurons_checkpoint_{checkpoint_value}.csv"
+        analysis_filename = f"universal_analysis_checkpoint_{checkpoint_value}.csv"
+    
+    universal_path = os.path.join(output_dir, universal_filename)
+    analysis_path = os.path.join(output_dir, analysis_filename)
+    
+    if os.path.exists(universal_path) and os.path.exists(analysis_path):
+        status['universal_analysis'] = {
+            'exists': True,
+            'universal_path': universal_path,
+            'analysis_path': analysis_path
+        }
+        print(f"  ✓ Found: {universal_filename}")
+        print(f"  ✓ Found: {analysis_filename}")
+    else:
+        status['universal_analysis'] = {'exists': False}
+        status['needs_computation']['universal_analysis'] = True
+        if not os.path.exists(universal_path):
+            print(f"  ✗ Missing: {universal_filename}")
+        if not os.path.exists(analysis_path):
+            print(f"  ✗ Missing: {analysis_filename}")
+    
+    return status
+
+def load_existing_neuron_stats(model_names: List[str], output_dir: str, checkpoint_value: Optional[Union[int, str]] = None) -> Dict[str, pd.DataFrame]:
+    """Load existing neuron statistics files"""
+    neuron_stats = {}
+    
+    for model_name in model_names:
+        generator = NeuronStatsGenerator(model_name, checkpoint_value=checkpoint_value)
+        if generator.stats_file_exists(output_dir):
+            print(f"Loading existing stats for {model_name}...")
+            stats_df = generator.load_existing_stats(output_dir)
+            model_id = generator._get_model_identifier(model_name) if hasattr(generator, '_get_model_identifier') else (
+                f"{model_name}_checkpoint_{checkpoint_value}" if checkpoint_value else model_name
+            )
+            neuron_stats[model_id] = stats_df
+        else:
+            print(f"No existing stats found for {model_name}")
+    
+    return neuron_stats
+
+def find_existing_correlation_files(output_dir: str, checkpoint_value: Optional[Union[int, str]] = None) -> List[str]:
+    """Find all existing correlation files in output directory"""
+    if checkpoint_value is not None:
+        pattern = os.path.join(output_dir, f"correlation_*_checkpoint_{checkpoint_value}.pt")
+    else:
+        pattern = os.path.join(output_dir, "correlation_*.pt")
+    
+    correlation_files = glob.glob(pattern)
+    return correlation_files
+
+# ============================================================================
+# 5. MAIN PIPELINE (MODIFIED WITH CHECKPOINTING)
 # ============================================================================
 
 def run_universal_neurons_analysis(
@@ -627,9 +807,21 @@ def run_universal_neurons_analysis(
     output_dir: str = "universal_neurons_results",
     correlation_threshold: float = 0.5,
     min_models: int = 3,
-    checkpoint_value: Optional[Union[int, str]] = None
+    checkpoint_value: Optional[Union[int, str]] = None,
+    force_recompute: bool = False
 ):
-    """Run complete universal neurons analysis pipeline with disk-based correlation storage"""
+    """
+    Run complete universal neurons analysis pipeline with file-based checkpointing
+    
+    Args:
+        model_names: List of model names to analyze
+        dataset_path: Path to tokenized dataset
+        output_dir: Directory to save results
+        correlation_threshold: Threshold for universal neuron identification
+        min_models: Minimum number of models a neuron must appear in
+        checkpoint_value: Specific checkpoint to analyze
+        force_recompute: If True, recompute everything regardless of existing files
+    """
     
     # Modify output directory to include checkpoint info
     if checkpoint_value is not None:
@@ -637,75 +829,148 @@ def run_universal_neurons_analysis(
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Step 1: Generate neuron statistics for each model
-    print("=" * 50)
+    print("=" * 60)
+    print("UNIVERSAL NEURONS ANALYSIS WITH FILE CHECKPOINTING")
+    if checkpoint_value is not None:
+        print(f"CHECKPOINT: {checkpoint_value}")
+    print("=" * 60)
+    
+    # Check existing files unless force recompute
+    if not force_recompute:
+        print("\nChecking for existing files...")
+        file_status = check_existing_files(model_names, output_dir, checkpoint_value)
+        
+        print(f"\nSummary:")
+        print(f"  Neuron stats: {len(model_names) - len(file_status['needs_computation']['neuron_stats'])}/{len(model_names)} models complete")
+        print(f"  Correlations: {len([p for p in file_status['correlations'].values() if p['exists']])}/{len(file_status['correlations'])} pairs complete")
+        print(f"  Universal analysis: {'✓' if file_status['universal_analysis'].get('exists', False) else '✗'}")
+    else:
+        print("\nForce recompute enabled - will regenerate all files")
+        file_status = {'needs_computation': {'neuron_stats': model_names, 'correlations': [], 'universal_analysis': True}}
+        # Generate all correlation pairs that need computation
+        for i, model1 in enumerate(model_names):
+            for j, model2 in enumerate(model_names[i:], i):
+                if i != j:
+                    file_status['needs_computation']['correlations'].append((model1, model2))
+    
+    # Step 1: Generate neuron statistics for each model (skip if exists)
+    print("\n" + "=" * 50)
     print("STEP 1: GENERATING NEURON STATISTICS")
     if checkpoint_value is not None:
         print(f"CHECKPOINT: {checkpoint_value}")
     print("=" * 50)
     
     neuron_stats = {}
-    for model_name in model_names:
-        print(f"\nProcessing {model_name}...")
-        generator = NeuronStatsGenerator(model_name, checkpoint_value=checkpoint_value)
-        stats_df = generator.generate_full_neuron_dataframe(dataset_path)
-        
-        # Use the model identifier that includes checkpoint info
-        model_id = generator.model_identifier
-        neuron_stats[model_id] = stats_df
-        
-        # Save individual model stats with checkpoint info in filename
-        safe_model_name = model_name.replace('/', '_')
-        if checkpoint_value is not None:
-            filename = f"{safe_model_name}_checkpoint_{checkpoint_value}_neuron_stats.csv"
-        else:
-            filename = f"{safe_model_name}_neuron_stats.csv"
-        stats_df.to_csv(f"{output_dir}/{filename}")
-        print(f"Saved stats for {model_id}: {len(stats_df)} neurons")
     
-    # Step 2: Compute correlations between models (with immediate disk storage)
+    # Load existing stats first
+    if not force_recompute:
+        existing_stats = load_existing_neuron_stats(model_names, output_dir, checkpoint_value)
+        neuron_stats.update(existing_stats)
+    
+    # Compute missing stats
+    missing_models = file_status['needs_computation']['neuron_stats'] if not force_recompute else model_names
+    
+    if missing_models:
+        print(f"Computing stats for {len(missing_models)} models...")
+        for model_name in missing_models:
+            print(f"\nProcessing {model_name}...")
+            generator = NeuronStatsGenerator(model_name, checkpoint_value=checkpoint_value)
+            stats_df = generator.generate_full_neuron_dataframe(dataset_path, output_dir)
+            
+            # Use the model identifier that includes checkpoint info
+            model_id = generator.model_identifier
+            neuron_stats[model_id] = stats_df
+            print(f"Saved stats for {model_id}: {len(stats_df)} neurons")
+    else:
+        print("All neuron statistics files already exist - skipping computation")
+    
+    print(f"Total models with stats: {len(neuron_stats)}")
+    
+    # Step 2: Compute correlations between models (skip existing pairs)
     print("\n" + "=" * 50)
     print("STEP 2: COMPUTING INTER-MODEL CORRELATIONS")  
     print("=" * 50)
     
-    correlator = NeuronCorrelationComputer(model_names, checkpoint_value=checkpoint_value)
-    correlation_files = correlator.compute_all_correlations(dataset_path, output_dir)
+    # Get existing correlation files
+    if not force_recompute:
+        existing_correlation_files = find_existing_correlation_files(output_dir, checkpoint_value)
+        print(f"Found {len(existing_correlation_files)} existing correlation files")
+    else:
+        existing_correlation_files = []
     
-    print(f"Saved {len(correlation_files)} correlation files to disk")
-    for file in correlation_files:
+    # Compute missing correlations
+    missing_pairs = file_status['needs_computation']['correlations'] if not force_recompute else []
+    if force_recompute:
+        # Generate all pairs
+        for i, model1 in enumerate(model_names):
+            for j, model2 in enumerate(model_names[i:], i):
+                if i != j:
+                    missing_pairs.append((model1, model2))
+    
+    if missing_pairs:
+        print(f"Computing correlations for {len(missing_pairs)} model pairs...")
+        correlator = NeuronCorrelationComputer(model_names, checkpoint_value=checkpoint_value)
+        
+        new_correlation_files = []
+        for model1, model2 in missing_pairs:
+            print(f"\nComputing correlation: {model1} vs {model2}")
+            corr_file = correlator.compute_pairwise_correlation(
+                model1, model2, dataset_path, output_dir
+            )
+            new_correlation_files.append(corr_file)
+            
+            # Optional: force garbage collection to free memory
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Combine with existing files
+        all_correlation_files = existing_correlation_files + new_correlation_files
+    else:
+        print("All correlation files already exist - skipping computation")
+        all_correlation_files = existing_correlation_files
+    
+    print(f"Total correlation files: {len(all_correlation_files)}")
+    for file in all_correlation_files:
         print(f"  - {os.path.basename(file)}")
     
-    # Step 3: Identify universal neurons (loading correlations from disk as needed)
+    # Step 3: Identify universal neurons (skip if exists)
     print("\n" + "=" * 50)
     print("STEP 3: IDENTIFYING UNIVERSAL NEURONS")
     print("=" * 50)
     
-    analyzer = UniversalNeuronAnalyzer(correlation_files, neuron_stats)
-    universal_df = analyzer.identify_universal_neurons(
-        threshold=correlation_threshold,
-        min_models=min_models
-    )
-    
     universal_filename = "universal_neurons.csv"
-    if checkpoint_value is not None:
-        universal_filename = f"universal_neurons_checkpoint_{checkpoint_value}.csv"
-    universal_file = f"{output_dir}/{universal_filename}"
-    universal_df.to_csv(universal_file, index=False)
-    print(f"Found {len(universal_df)} universal neurons")
-    print(f"Saved to {universal_file}")
-    
-    # Step 4: Analyze universal neuron properties
-    print("\n" + "=" * 50)
-    print("STEP 4: ANALYZING UNIVERSAL NEURON PROPERTIES")
-    print("=" * 50)
-    
-    analysis_df = analyzer.analyze_universal_properties(universal_df)
     analysis_filename = "universal_analysis.csv"
     if checkpoint_value is not None:
+        universal_filename = f"universal_neurons_checkpoint_{checkpoint_value}.csv"
         analysis_filename = f"universal_analysis_checkpoint_{checkpoint_value}.csv"
-    analysis_file = f"{output_dir}/{analysis_filename}"
-    analysis_df.to_csv(analysis_file, index=False)
-    print(f"Saved analysis to {analysis_file}")
+    
+    universal_file = os.path.join(output_dir, universal_filename)
+    analysis_file = os.path.join(output_dir, analysis_filename)
+    
+    if not force_recompute and os.path.exists(universal_file) and os.path.exists(analysis_file):
+        print("Universal analysis files already exist - loading existing results")
+        universal_df = pd.read_csv(universal_file)
+        analysis_df = pd.read_csv(analysis_file)
+        print(f"Loaded {len(universal_df)} universal neurons from existing file")
+    else:
+        print("Computing universal neuron analysis...")
+        analyzer = UniversalNeuronAnalyzer(all_correlation_files, neuron_stats)
+        universal_df = analyzer.identify_universal_neurons(
+            threshold=correlation_threshold,
+            min_models=min_models
+        )
+        
+        universal_df.to_csv(universal_file, index=False)
+        print(f"Found {len(universal_df)} universal neurons")
+        print(f"Saved to {universal_file}")
+        
+        # Step 4: Analyze universal neuron properties
+        print("\n" + "=" * 50)
+        print("STEP 4: ANALYZING UNIVERSAL NEURON PROPERTIES")
+        print("=" * 50)
+        
+        analysis_df = analyzer.analyze_universal_properties(universal_df)
+        analysis_df.to_csv(analysis_file, index=False)
+        print(f"Saved analysis to {analysis_file}")
     
     # Summary
     print("\n" + "=" * 50)
@@ -717,18 +982,31 @@ def run_universal_neurons_analysis(
     print(f"Universal neurons found: {len(universal_df)}")
     print(f"Mean correlation threshold: {correlation_threshold}")
     print(f"Results saved to: {output_dir}")
-    print(f"Correlation files: {len(correlation_files)} individual files")
+    print(f"Correlation files: {len(all_correlation_files)} individual files")
+    
+    print(f"\nKey files generated:")
+    print(f"  - {universal_file}")
+    print(f"  - {analysis_file}")
+    for model_name in model_names:
+        generator = NeuronStatsGenerator(model_name, checkpoint_value=checkpoint_value)
+        stats_file = generator.get_expected_filename(output_dir)
+        print(f"  - {os.path.basename(stats_file)}")
+    
+    print(f"\nFile checkpointing enabled:")
+    print(f"  - Rerunning will skip existing computations")
+    print(f"  - Use force_recompute=True to regenerate all files")
+    print(f"  - Individual files can be deleted to recompute specific parts")
     
     return {
         'neuron_stats': neuron_stats,
-        'correlation_files': correlation_files,  # Return file paths instead of loaded data
+        'correlation_files': all_correlation_files,
         'universal_neurons': universal_df,
         'analysis': analysis_df,
         'checkpoint': checkpoint_value
     }
 
 # ============================================================================
-# 5. USAGE EXAMPLE (UNCHANGED FROM ORIGINAL)
+# 6. USAGE EXAMPLE WITH CHECKPOINTING
 # ============================================================================
 
 if __name__ == "__main__":
@@ -744,12 +1022,21 @@ if __name__ == "__main__":
     # You'll need to create/download a tokenized dataset
     dataset_path = "path/to/tokenized/dataset"
     
-    # Run analysis
+    # Run analysis with checkpointing (default behavior)
+    print("Running analysis with automatic checkpointing...")
     results = run_universal_neurons_analysis(
         model_names=models,
         dataset_path=dataset_path,
         output_dir="universal_neurons_results",
         correlation_threshold=0.5,
         min_models=3,
-        checkpoint_value=1000  # Example: analyze at step 1000
+        checkpoint_value=1000,  # Example: analyze at step 1000
+        force_recompute=False   # Will skip existing files
     )
+    
+    # To force recomputation of everything:
+    # results = run_universal_neurons_analysis(
+    #     model_names=models,
+    #     dataset_path=dataset_path,
+    #     force_recompute=True
+    # )
