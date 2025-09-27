@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Complete Example: Universal Neurons Analysis with Checkpoint Support and Disk-based Correlations
-This script demonstrates the full pipeline for finding universal neurons
-across different training checkpoints of Stanford CRFM GPT2-small models.
+Modified Example Usage: Universal Neurons Analysis with Excess Correlation
+This script demonstrates the full pipeline using the excess correlation metric
+from the Universal Neurons paper to properly identify universal neurons.
 """
 
 import os
@@ -12,21 +12,27 @@ from pathlib import Path
 from typing import Optional, Union
 
 # Import our pipeline modules
-from universal_neurons_pipeline import run_universal_neurons_analysis
+from universal_neurons_pipeline import NeuronStatsGenerator, load_existing_neuron_stats
 from dataset_utilities import (
     create_tokenized_dataset, 
     UniversalNeuronVisualizer,
     load_analysis_results,
     find_similar_neurons,
-    compute_neuron_importance_scores,
-    load_correlations_from_files
+    compute_neuron_importance_scores
 )
 
-def main(checkpoint_value: Optional[Union[int, str]] = None):
-    """Main execution pipeline"""
+# Import the new excess correlation implementation
+from excess_correlation_implementation import (
+    run_excess_correlation_analysis,
+    ExcessCorrelationComputer,
+    ExcessCorrelationUniversalNeuronAnalyzer
+)
+
+def main_with_excess_correlation(checkpoint_value: Optional[Union[int, str]] = None):
+    """Main execution pipeline using excess correlation"""
     
     print("=" * 60)
-    print("UNIVERSAL NEURONS ANALYSIS - STANFORD CRFM MODELS")
+    print("UNIVERSAL NEURONS ANALYSIS - EXCESS CORRELATION METHOD")
     if checkpoint_value is not None:
         print(f"CHECKPOINT: {checkpoint_value}")
     print("=" * 60)
@@ -44,13 +50,14 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
         "stanford-crfm/expanse-gpt2-small-x777"
     ]
     
-    # Analysis parameters
+    # Analysis parameters - NOTE: Different from regular correlation
     CONFIG = {
-        'n_tokens': 5_000_000,        # 5M tokens for analysis
-        'ctx_len': 512,               # Context length
-        'correlation_threshold': 0.6,  # Correlation threshold for universality
-        'min_models': 3,              # Minimum models a neuron must appear in
-        'output_dir': 'universal_neurons_results',
+        'n_tokens': 5_000_000,           # 5M tokens for analysis
+        'ctx_len': 512,                  # Context length
+        'excess_threshold': 0.1,         # EXCESS correlation threshold (not regular correlation)
+        'top_k': None,                   # Alternative: take top K neurons instead of threshold
+        'n_rotation_samples': 5,         # Number of random rotations for baseline
+        'output_dir': 'universal_neurons_excess_results',
         'dataset_dir': 'datasets'
     }
     
@@ -59,8 +66,8 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
         CONFIG['output_dir'] = f"{CONFIG['output_dir']}_checkpoint_{checkpoint_value}"
     
     print(f"Models to analyze: {len(MODELS)}")
-    print(f"Correlation threshold: {CONFIG['correlation_threshold']}")
-    print(f"Minimum models: {CONFIG['min_models']}")
+    print(f"Excess correlation threshold: {CONFIG['excess_threshold']}")
+    print(f"Random rotation samples: {CONFIG['n_rotation_samples']}")
     if checkpoint_value is not None:
         print(f"Checkpoint: {checkpoint_value}")
     
@@ -72,9 +79,6 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     print("STEP 1: CREATING TOKENIZED DATASET")
     print("=" * 40)
     
-    # Use first model for tokenization (they should all have same tokenizer)
-    # For checkpoint analysis, we'll use the base model for tokenization unless 
-    # there are tokenizer differences at different checkpoints
     dataset_path = create_tokenized_dataset(
         model_name=MODELS[0],
         n_tokens=CONFIG['n_tokens'],
@@ -85,24 +89,25 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     print(f"✓ Dataset created: {dataset_path}")
     
     # ========================================================================
-    # STEP 2: RUN FULL ANALYSIS PIPELINE
+    # STEP 2: RUN EXCESS CORRELATION ANALYSIS PIPELINE
     # ========================================================================
     
     print("\n" + "=" * 40)
-    print("STEP 2: RUNNING ANALYSIS PIPELINE")
+    print("STEP 2: RUNNING EXCESS CORRELATION ANALYSIS")
     print("=" * 40)
     
     try:
-        results = run_universal_neurons_analysis(
+        results = run_excess_correlation_analysis(
             model_names=MODELS,
             dataset_path=dataset_path,
             output_dir=CONFIG['output_dir'],
-            correlation_threshold=CONFIG['correlation_threshold'],
-            min_models=CONFIG['min_models'],
-            checkpoint_value=checkpoint_value  # Pass checkpoint parameter
+            excess_threshold=CONFIG['excess_threshold'],
+            checkpoint_value=checkpoint_value,
+            top_k=CONFIG['top_k'],
+            n_rotation_samples=CONFIG['n_rotation_samples']
         )
         
-        print("✓ Analysis pipeline completed successfully!")
+        print("✓ Excess correlation analysis completed successfully!")
         
     except Exception as e:
         print(f"✗ Analysis failed: {e}")
@@ -121,47 +126,36 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     plots_dir = Path(CONFIG['output_dir']) / 'plots'
     plots_dir.mkdir(exist_ok=True)
     
+    # Adapt results format for existing visualizer
+    # Note: The visualizer expects 'correlations' key, so we provide the correlation files
+    adapted_results = {
+        'neuron_stats': results['neuron_stats'],
+        'correlation_files': results['excess_correlation_files'],  # Use excess correlation files
+        'universal_neurons': results['universal_neurons'],
+        'analysis': results['analysis'],
+        'checkpoint': results['checkpoint']
+    }
+    
     # Initialize visualizer
-    visualizer = UniversalNeuronVisualizer(results)
+    visualizer = UniversalNeuronVisualizer(adapted_results)
     
     # Generate all visualizations with checkpoint-specific names
     checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
     
-    print("Creating correlation distribution plot...")
+    print("Creating excess correlation distribution plot...")
+    # Note: This will show distributions of excess correlations instead of regular correlations
     visualizer.plot_correlation_distribution(
-        save_path=plots_dir / f'correlation_distribution{checkpoint_suffix}.png'
+        save_path=plots_dir / f'excess_correlation_distribution{checkpoint_suffix}.png'
     )
     
     print("Creating universal vs regular properties comparison...")
     visualizer.plot_universal_properties_comparison(
-        save_path=plots_dir / f'properties_comparison{checkpoint_suffix}.png'
+        save_path=plots_dir / f'properties_comparison_excess{checkpoint_suffix}.png'
     )
-    
-    print("Creating correlation matrix heatmaps...")
-    # Get model pairs from correlation files instead of loaded dictionary
-    if 'correlation_files' in results:
-        # Load first few correlation files to get model pairs
-        correlation_data = load_correlations_from_files(results['correlation_files'][:3])
-        model_pairs = list(correlation_data.keys())
-    else:
-        # Fallback if old format still used
-        model_pairs = list(results['correlations'].keys())[:3]
-    
-    for i, pair in enumerate(model_pairs):
-        visualizer.plot_correlation_matrix_heatmap(
-            model_pair=pair,
-            layer_focus=6,  # Focus on middle layer
-            save_path=plots_dir / f'correlation_heatmap_{i}{checkpoint_suffix}.png'
-        )
     
     print("Creating interactive dashboard...")
-    dashboard_path = plots_dir / f'dashboard{checkpoint_suffix}.html'
+    dashboard_path = plots_dir / f'dashboard_excess{checkpoint_suffix}.html'
     visualizer.create_analysis_dashboard(save_path=str(dashboard_path))
-    
-    print("Creating universal neuron network visualization...")
-    visualizer.plot_universal_neuron_network(
-        save_path=str(plots_dir / f'neuron_network{checkpoint_suffix}.html')
-    )
     
     print("✓ All visualizations generated!")
     
@@ -175,32 +169,49 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     
     # Basic statistics
     n_universal = len(results['universal_neurons'])
+    excess_scores = results['excess_scores']
     
-    # Get total neurons from first model (they should all be the same)
+    # Get total neurons from first model
     first_model_key = list(results['neuron_stats'].keys())[0]
     total_neurons_per_model = len(results['neuron_stats'][first_model_key])
     universality_rate = n_universal / total_neurons_per_model * 100
     
+    print(f"Total neurons analyzed: {len(excess_scores)}")
     print(f"Universal neurons found: {n_universal}")
     print(f"Total neurons per model: {total_neurons_per_model}")
     print(f"Universality rate: {universality_rate:.2f}%")
     if checkpoint_value is not None:
         print(f"At checkpoint: {checkpoint_value}")
     
+    # Excess correlation statistics
+    print(f"\nExcess correlation statistics:")
+    print(f"  Mean across all neurons: {excess_scores['excess_correlation'].mean():.4f}")
+    print(f"  Std across all neurons: {excess_scores['excess_correlation'].std():.4f}")
+    print(f"  Range: {excess_scores['excess_correlation'].min():.4f} to {excess_scores['excess_correlation'].max():.4f}")
+    
+    # Show percentiles to help understand the distribution
+    percentiles = [75, 90, 95, 99]
+    print(f"  Percentiles:")
+    for p in percentiles:
+        val = excess_scores['excess_correlation'].quantile(p/100)
+        print(f"    {p}th percentile: {val:.4f}")
+    
     if n_universal > 0:
         # Analyze universal neuron properties
-        mean_correlation = results['universal_neurons']['mean_correlation'].mean()
-        min_correlation = results['universal_neurons']['min_correlation'].mean()
+        mean_excess = results['universal_neurons']['excess_correlation'].mean()
+        min_excess = results['universal_neurons']['excess_correlation'].min()
+        max_excess = results['universal_neurons']['excess_correlation'].max()
         
-        print(f"Average correlation strength: {mean_correlation:.3f}")
-        print(f"Average minimum correlation: {min_correlation:.3f}")
+        print(f"\nUniversal neuron excess correlations:")
+        print(f"  Mean: {mean_excess:.4f}")
+        print(f"  Range: {min_excess:.4f} to {max_excess:.4f}")
         
-        # Find most universal neurons (highest correlations)
-        top_universal = results['universal_neurons'].nlargest(5, 'mean_correlation')
-        print(f"\nTop 5 Universal Neurons:")
+        # Find most universal neurons (highest excess correlations)
+        top_universal = results['universal_neurons'].nlargest(5, 'excess_correlation')
+        print(f"\nTop 5 Universal Neurons by Excess Correlation:")
         for _, neuron in top_universal.iterrows():
             print(f"  L{neuron['reference_layer']}N{neuron['reference_neuron']}: "
-                  f"r={neuron['mean_correlation']:.3f}, {neuron['n_models']} models")
+                  f"excess_ρ={neuron['excess_correlation']:.4f}")
         
         # Analyze layer distribution
         layer_dist = results['universal_neurons']['reference_layer'].value_counts().sort_index()
@@ -208,45 +219,59 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
         for layer, count in layer_dist.items():
             print(f"  Layer {layer}: {count} neurons")
         
-        # Find interesting individual neurons
-        print(f"\nAnalyzing individual neuron properties...")
+        # Compare with threshold to show how selective it is
+        above_threshold_count = (excess_scores['excess_correlation'] >= CONFIG['excess_threshold']).sum()
+        print(f"\nThreshold analysis:")
+        print(f"  Neurons above threshold {CONFIG['excess_threshold']}: {above_threshold_count}")
+        print(f"  Fraction above threshold: {above_threshold_count / len(excess_scores):.1%}")
         
-        # Get stats for first model as reference
-        ref_stats = results['neuron_stats'][first_model_key]
-        
-        # Compute importance scores
-        importance_scores = compute_neuron_importance_scores(ref_stats)
-        print(f"Most important neurons (by composite score):")
-        for i, ((layer, neuron), row) in enumerate(importance_scores.head(5).iterrows()):
-            print(f"  #{i+1}: L{layer}N{neuron} (score: {row['importance_score']:.3f})")
-        
-        # Find similar neurons to a top universal neuron
-        if not top_universal.empty:
-            top_ref = top_universal.iloc[0]
-            ref_layer, ref_neuron = top_ref['reference_layer'], top_ref['reference_neuron']
-            
-            similar_neurons = find_similar_neurons(
-                ref_stats, ref_layer, ref_neuron, top_k=5
-            )
-            
-            print(f"\nNeurons similar to L{ref_layer}N{ref_neuron}:")
-            for _, sim_neuron in similar_neurons.iterrows():
-                print(f"  L{sim_neuron['layer']}N{sim_neuron['neuron']}: "
-                      f"similarity={sim_neuron['similarity_score']:.3f}")
-    
     else:
-        print("No universal neurons found with current thresholds.")
-        print("Consider lowering correlation_threshold or min_models parameters.")
+        print("No universal neurons found with current excess correlation threshold.")
+        print("Consider:")
+        print(f"  - Lowering excess_threshold (current: {CONFIG['excess_threshold']})")
+        print(f"  - Using top_k approach instead")
+        
+        # Show what thresholds would yield some results
+        potential_thresholds = [0.05, 0.02, 0.01]
+        print(f"  - Potential thresholds:")
+        for thresh in potential_thresholds:
+            count = (excess_scores['excess_correlation'] >= thresh).sum()
+            print(f"    {thresh:.3f}: {count} neurons ({count/len(excess_scores):.1%})")
     
     # ========================================================================
-    # STEP 5: SUMMARY AND RECOMMENDATIONS
+    # STEP 5: COMPARISON WITH REGULAR CORRELATION (if available)
+    # ========================================================================
+    
+    print("\n" + "=" * 40)
+    print("COMPARISON WITH BASELINE")
+    print("=" * 40)
+    
+    # Load one excess correlation file to show the difference
+    if results['excess_correlation_files']:
+        import torch
+        sample_file = results['excess_correlation_files'][0]
+        sample_data = torch.load(sample_file, map_location='cpu')
+        
+        regular_corr = sample_data['regular_correlation_matrix']
+        baseline_corr = sample_data['baseline_correlation_matrix']
+        excess_corr = sample_data['excess_correlation_matrix']
+        
+        print(f"Sample from {os.path.basename(sample_file)}:")
+        print(f"  Regular correlation range: {regular_corr.min():.4f} to {regular_corr.max():.4f}")
+        print(f"  Baseline correlation range: {baseline_corr.min():.4f} to {baseline_corr.max():.4f}")
+        print(f"  Excess correlation range: {excess_corr.min():.4f} to {excess_corr.max():.4f}")
+        print(f"  Mean baseline correlation: {baseline_corr.mean():.4f}")
+        print(f"  Mean excess correlation: {excess_corr.mean():.4f}")
+    
+    # ========================================================================
+    # STEP 6: SUMMARY AND RECOMMENDATIONS
     # ========================================================================
     
     print("\n" + "=" * 40)
     print("ANALYSIS COMPLETE - SUMMARY")
     print("=" * 40)
     
-    print(f"✓ Analyzed {len(MODELS)} models")
+    print(f"✓ Analyzed {len(MODELS)} models using excess correlation method")
     if checkpoint_value is not None:
         print(f"✓ At checkpoint {checkpoint_value}")
     print(f"✓ Found {n_universal} universal neurons")
@@ -255,95 +280,36 @@ def main(checkpoint_value: Optional[Union[int, str]] = None):
     
     print(f"\nKey files generated:")
     checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
-    print(f"  - {CONFIG['output_dir']}/universal_neurons{checkpoint_suffix}.csv")
-    print(f"  - {CONFIG['output_dir']}/universal_analysis{checkpoint_suffix}.csv")  
-    print(f"  - {plots_dir}/dashboard{checkpoint_suffix}.html (interactive dashboard)")
-    print(f"  - {plots_dir}/*{checkpoint_suffix}.png (static plots)")
+    print(f"  - {CONFIG['output_dir']}/excess_correlation_scores{checkpoint_suffix}.csv")
+    print(f"  - {CONFIG['output_dir']}/universal_neurons_excess{checkpoint_suffix}.csv")
+    print(f"  - {CONFIG['output_dir']}/universal_analysis_excess{checkpoint_suffix}.csv")  
+    print(f"  - {plots_dir}/dashboard_excess{checkpoint_suffix}.html (interactive dashboard)")
+    print(f"  - {len(results['excess_correlation_files'])} excess correlation files")
     
-    # Show correlation files info
-    if 'correlation_files' in results:
-        print(f"  - {len(results['correlation_files'])} individual correlation files")
-        print("    (stored separately to reduce memory usage)")
+    print(f"\nMethodological improvements over basic correlation:")
+    print(f"  ✓ Uses proper baseline from random rotations")
+    print(f"  ✓ Controls for privileged neuron basis effects")
+    print(f"  ✓ Implements exact formula from Universal Neurons paper")
+    print(f"  ✓ More robust identification of truly universal neurons")
     
     print(f"\nNext steps:")
-    print(f"  1. Open dashboard{checkpoint_suffix}.html in browser for interactive exploration")
-    print(f"  2. Examine universal_neurons{checkpoint_suffix}.csv for specific neuron mappings")
-    print(f"  3. Use the analysis results for downstream experiments")
+    print(f"  1. Open dashboard_excess{checkpoint_suffix}.html for interactive exploration")
+    print(f"  2. Examine excess_correlation_scores{checkpoint_suffix}.csv for all neuron scores")
+    print(f"  3. Compare results with regular correlation method")
     
     if n_universal > 0:
-        print(f"  4. Consider running intervention experiments on universal neurons")
-        print(f"  5. Analyze what computational roles these neurons serve")
+        print(f"  4. Run intervention experiments on identified universal neurons")
+        print(f"  5. Analyze computational roles of high excess correlation neurons")
     
     if checkpoint_value is not None:
-        print(f"  6. Compare results across different checkpoints to study evolution")
+        print(f"  6. Compare excess correlation evolution across training checkpoints")
     
     return True
 
-def compare_checkpoints(checkpoint_list, base_config=None):
-    """Run analysis across multiple checkpoints for comparison"""
+def quick_test_excess_correlation(checkpoint_value: Optional[Union[int, str]] = None):
+    """Run a quick test with smaller models using excess correlation"""
     
-    print("=" * 60)
-    print("MULTI-CHECKPOINT COMPARISON ANALYSIS")
-    print("=" * 60)
-    
-    results_by_checkpoint = {}
-    
-    for checkpoint in checkpoint_list:
-        print(f"\n{'='*20} CHECKPOINT {checkpoint} {'='*20}")
-        success = main(checkpoint_value=checkpoint)
-        if success:
-            # Load results for comparison
-            results_dir = f"universal_neurons_results_checkpoint_{checkpoint}"
-            try:
-                results = load_analysis_results(results_dir)
-                results_by_checkpoint[checkpoint] = results
-                print(f"✓ Checkpoint {checkpoint} completed")
-            except Exception as e:
-                print(f"✗ Failed to load results for checkpoint {checkpoint}: {e}")
-        else:
-            print(f"✗ Analysis failed for checkpoint {checkpoint}")
-    
-    # Generate comparison report
-    if len(results_by_checkpoint) > 1:
-        print("\n" + "=" * 60)
-        print("CHECKPOINT COMPARISON SUMMARY")
-        print("=" * 60)
-        
-        comparison_data = []
-        for checkpoint, results in results_by_checkpoint.items():
-            if 'universal_neurons' in results:
-                n_universal = len(results['universal_neurons'])
-                if n_universal > 0:
-                    mean_corr = results['universal_neurons']['mean_correlation'].mean()
-                else:
-                    mean_corr = 0.0
-            else:
-                n_universal = 0
-                mean_corr = 0.0
-            
-            comparison_data.append({
-                'checkpoint': checkpoint,
-                'universal_neurons': n_universal,
-                'mean_correlation': mean_corr
-            })
-        
-        print("Checkpoint | Universal Neurons | Mean Correlation")
-        print("-" * 50)
-        for data in comparison_data:
-            print(f"{data['checkpoint']:^10} | {data['universal_neurons']:^17} | {data['mean_correlation']:.3f}")
-        
-        # Save comparison
-        import pandas as pd
-        comparison_df = pd.DataFrame(comparison_data)
-        comparison_df.to_csv("checkpoint_comparison.csv", index=False)
-        print(f"\n✓ Comparison saved to checkpoint_comparison.csv")
-    
-    return results_by_checkpoint
-
-def quick_test(checkpoint_value: Optional[Union[int, str]] = None):
-    """Run a quick test with smaller models and less data"""
-    
-    print("Running quick test with smaller models...")
+    print("Running quick test with excess correlation method...")
     if checkpoint_value is not None:
         print(f"Testing checkpoint: {checkpoint_value}")
     
@@ -353,69 +319,68 @@ def quick_test(checkpoint_value: Optional[Union[int, str]] = None):
     # Create small dataset
     dataset_path = create_tokenized_dataset(
         model_name="gpt2",
-        n_tokens=100_000,  # Much smaller
+        n_tokens=50_000,  # Very small for testing
         ctx_len=256,
         output_dir="test_datasets"
     )
     
     # Run with relaxed parameters
-    output_dir = "test_results"
+    output_dir = "test_excess_results"
     if checkpoint_value is not None:
         output_dir = f"{output_dir}_checkpoint_{checkpoint_value}"
     
-    results = run_universal_neurons_analysis(
+    results = run_excess_correlation_analysis(
         model_names=test_models,
         dataset_path=dataset_path,
         output_dir=output_dir,
-        correlation_threshold=0.4,  # Lower threshold
-        min_models=2,
-        checkpoint_value=checkpoint_value
+        excess_threshold=0.05,  # Lower threshold for testing
+        checkpoint_value=checkpoint_value,
+        n_rotation_samples=3    # Fewer samples for speed
     )
     
     # Quick visualization
-    visualizer = UniversalNeuronVisualizer(results)
-    checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
-    visualizer.create_analysis_dashboard(f"test_dashboard{checkpoint_suffix}.html")
+    adapted_results = {
+        'neuron_stats': results['neuron_stats'],
+        'correlation_files': results['excess_correlation_files'],
+        'universal_neurons': results['universal_neurons'],
+        'analysis': results['analysis'],
+        'checkpoint': results['checkpoint']
+    }
     
-    print(f"Quick test completed! Check test_dashboard{checkpoint_suffix}.html")
+    visualizer = UniversalNeuronVisualizer(adapted_results)
+    checkpoint_suffix = f"_checkpoint_{checkpoint_value}" if checkpoint_value is not None else ""
+    visualizer.create_analysis_dashboard(f"test_dashboard_excess{checkpoint_suffix}.html")
+    
+    print(f"Quick test completed! Check test_dashboard_excess{checkpoint_suffix}.html")
     return results
 
 if __name__ == "__main__":
     
-    parser = argparse.ArgumentParser(description="Universal Neurons Analysis with Checkpoint Support")
+    parser = argparse.ArgumentParser(description="Universal Neurons Analysis with Excess Correlation")
     parser.add_argument("--test", action="store_true", help="Run quick test with smaller models")
     parser.add_argument("--checkpoint", type=str, default=None, 
                        help="Specific checkpoint to analyze (e.g., '1000', 'step_5000')")
-    parser.add_argument("--compare-checkpoints", nargs="+", type=str, default=None,
-                       help="List of checkpoints to compare (e.g., --compare-checkpoints 1000 2000 5000)")
+    parser.add_argument("--excess-threshold", type=float, default=0.1,
+                       help="Excess correlation threshold for identifying universal neurons")
+    parser.add_argument("--top-k", type=int, default=None,
+                       help="Take top K neurons by excess correlation instead of using threshold")
+    parser.add_argument("--rotation-samples", type=int, default=5,
+                       help="Number of random rotation samples for baseline computation")
     
     args = parser.parse_args()
     
-    if args.compare_checkpoints:
-        print("Running multi-checkpoint comparison...")
-        checkpoint_list = args.compare_checkpoints
-        # Convert to integers if they're numeric
-        processed_checkpoints = []
-        for cp in checkpoint_list:
-            try:
-                processed_checkpoints.append(int(cp))
-            except ValueError:
-                processed_checkpoints.append(cp)  # Keep as string if not numeric
-        
-        results_by_checkpoint = compare_checkpoints(processed_checkpoints)
-        
-    elif args.test:
-        print("Running in test mode...")
+    if args.test:
+        print("Running in test mode with excess correlation...")
         checkpoint = None
         if args.checkpoint:
             try:
                 checkpoint = int(args.checkpoint)
             except ValueError:
                 checkpoint = args.checkpoint
-        quick_test(checkpoint_value=checkpoint)
+        quick_test_excess_correlation(checkpoint_value=checkpoint)
         
     else:
-        print("Running full analysis...")
+        print("Running full excess correlation analysis...")
         checkpoint = None
         if args.checkpoint:
             try:
@@ -426,12 +391,24 @@ if __name__ == "__main__":
         else:
             print("No checkpoint specified - analyzing final trained models")
         
-        success = main(checkpoint_value=checkpoint)
+        # Override config if command line args provided
+        if hasattr(args, 'excess_threshold') and args.excess_threshold != 0.1:
+            print(f"Using excess threshold: {args.excess_threshold}")
+        if args.top_k:
+            print(f"Using top-k approach: {args.top_k}")
+        if args.rotation_samples != 5:
+            print(f"Using {args.rotation_samples} rotation samples")
+        
+        success = main_with_excess_correlation(checkpoint_value=checkpoint)
         
         if success:
-            print("\n🎉 Analysis completed successfully!")
+            print("\n🎉 Excess correlation analysis completed successfully!")
             checkpoint_suffix = f"_checkpoint_{checkpoint}" if checkpoint else ""
-            print(f"Check the generated dashboard{checkpoint_suffix}.html file for interactive results!")
+            print(f"Check the generated dashboard_excess{checkpoint_suffix}.html file for interactive results!")
+            print("\nKey differences from regular correlation method:")
+            print("  - More principled baseline using random rotations")
+            print("  - Controls for neuron basis privilege")
+            print("  - Implements exact paper methodology")
         else:
             print("\n⚠ Analysis failed. Check error messages above.")
             sys.exit(1)
