@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Example Usage: Clean Universal Neurons Analysis
+Example Usage: Memory-Efficient Universal Neurons Analysis
 Demonstrates how to use the streamlined excess correlation method.
 """
 
@@ -30,14 +30,15 @@ def quick_test(checkpoint_value=None):
         output_dir="test_datasets"
     )
     
-    # Run analysis with relaxed parameters
+    # Run analysis with relaxed parameters and memory-efficient settings
     results = run_universal_neurons_analysis(
         model_names=test_models,
         dataset_path=dataset_path,
         output_dir="test_results",
         excess_threshold=0.02,  # Lower threshold for testing
         checkpoint_value=checkpoint_value,
-        n_rotation_samples=2    # Fewer samples for speed
+        n_rotation_samples=2,   # Fewer samples for speed
+        batch_size=2            # Very small batch size for testing
     )
     
     print("Quick test completed! Check test_results/ directory.")
@@ -60,19 +61,20 @@ def full_analysis(checkpoint_value=None):
     # Create larger dataset for full analysis
     dataset_path = create_tokenized_dataset(
         model_name=models[0],
-        n_tokens=2_000_000,  # 2M tokens
+        n_tokens=1_000_000,  # Reduced from 2M for memory efficiency
         ctx_len=512,
         output_dir="datasets"
     )
     
-    # Run full analysis
+    # Run full analysis with memory-efficient settings
     results = run_universal_neurons_analysis(
         model_names=models,
         dataset_path=dataset_path,
         output_dir="universal_neurons_results",
         excess_threshold=0.1,
         checkpoint_value=checkpoint_value,
-        n_rotation_samples=5
+        n_rotation_samples=5,
+        batch_size=4  # Reduced batch size for memory efficiency
     )
     
     print("Full analysis completed! Check universal_neurons_results/ directory.")
@@ -92,7 +94,7 @@ def analyze_checkpoint_progression(checkpoints):
     # Create dataset once
     dataset_path = create_tokenized_dataset(
         model_name=models[0],
-        n_tokens=1_000_000,
+        n_tokens=500_000,  # Reduced for memory efficiency
         output_dir="datasets"
     )
     
@@ -107,7 +109,8 @@ def analyze_checkpoint_progression(checkpoints):
             output_dir=f"checkpoint_analysis",
             excess_threshold=0.05,
             checkpoint_value=checkpoint,
-            n_rotation_samples=3
+            n_rotation_samples=3,  # Reduced for memory efficiency
+            batch_size=4           # Reduced for memory efficiency
         )
         
         checkpoint_results[checkpoint] = results
@@ -159,18 +162,54 @@ def analyze_checkpoint_progression(checkpoints):
     return checkpoint_results
 
 
+def memory_stress_test():
+    """Test with very small memory footprint"""
+    print("Running memory stress test with minimal settings...")
+    
+    models = ["gpt2", "distilgpt2"]
+    
+    dataset_path = create_tokenized_dataset(
+        model_name="gpt2",
+        n_tokens=20000,  # Very small dataset
+        ctx_len=128,     # Short sequences
+        output_dir="stress_test_datasets"
+    )
+    
+    results = run_universal_neurons_analysis(
+        model_names=models,
+        dataset_path=dataset_path,
+        output_dir="stress_test_results",
+        excess_threshold=0.01,
+        n_rotation_samples=1,  # Minimal rotations
+        batch_size=1           # Single sample batches
+    )
+    
+    print("Memory stress test completed!")
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Universal Neurons Analysis with Excess Correlation")
+    parser = argparse.ArgumentParser(description="Universal Neurons Analysis with Memory-Efficient Excess Correlation")
     parser.add_argument("--test", action="store_true", help="Run quick test with smaller models")
     parser.add_argument("--checkpoint", type=str, help="Specific checkpoint to analyze")
     parser.add_argument("--compare-checkpoints", nargs='+', type=int, 
                        help="Compare multiple checkpoints (e.g., --compare-checkpoints 1000 5000 10000)")
     parser.add_argument("--excess-threshold", type=float, default=0.1,
                        help="Excess correlation threshold for identifying universal neurons")
+    parser.add_argument("--memory-test", action="store_true", 
+                       help="Run memory stress test with minimal settings")
+    parser.add_argument("--batch-size", type=int, default=4,
+                       help="Batch size for processing (smaller = less memory)")
+    parser.add_argument("--n-rotations", type=int, default=5,
+                       help="Number of rotation samples for baseline (fewer = less memory)")
     
     args = parser.parse_args()
     
-    if args.test:
+    if args.memory_test:
+        print("Running memory stress test...")
+        memory_stress_test()
+        
+    elif args.test:
         print("Running in test mode...")
         checkpoint = None
         if args.checkpoint:
@@ -197,4 +236,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        

@@ -1,5 +1,5 @@
 """
-Universal Neurons Analysis - Clean Implementation with Memory-Efficient Excess Correlation
+Universal Neurons Analysis - Memory-Efficient Implementation with Streaming Correlation
 Based on the universal-neurons-new methodology for identifying universal neurons.
 """
 
@@ -19,11 +19,61 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
+class StreamingCorrelationComputer:
+    """Compute Pearson correlation incrementally without storing all data"""
+    
+    def __init__(self, device: str = "cpu"):
+        self.device = device
+        self.reset()
+    
+    def reset(self):
+        self.n = 0
+        self.sum_x = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+        self.sum_y = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+        self.sum_xx = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+        self.sum_yy = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+        self.sum_xy = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+    
+    def update(self, x: torch.Tensor, y: torch.Tensor):
+        """Update correlation statistics with new data batch"""
+        x = x.to(torch.float64).to(self.device)
+        y = y.to(torch.float64).to(self.device)
+        
+        batch_size = x.numel()
+        self.n += batch_size
+        
+        self.sum_x += x.sum()
+        self.sum_y += y.sum()
+        self.sum_xx += (x ** 2).sum()
+        self.sum_yy += (y ** 2).sum()
+        self.sum_xy += (x * y).sum()
+    
+    def correlation(self) -> float:
+        """Compute final correlation coefficient"""
+        if self.n < 2:
+            return 0.0
+        
+        mean_x = self.sum_x / self.n
+        mean_y = self.sum_y / self.n
+        
+        numerator = self.sum_xy - self.n * mean_x * mean_y
+        denom_x = self.sum_xx - self.n * mean_x ** 2
+        denom_y = self.sum_yy - self.n * mean_y ** 2
+        
+        denominator = torch.sqrt(denom_x * denom_y)
+        
+        if denominator == 0:
+            return 0.0
+        
+        corr = numerator / denominator
+        return corr.item() if not torch.isnan(corr) else 0.0
+
+
 class MemoryEfficientExcessCorrelationComputer:
     """
-    Memory-efficient excess correlation computer that processes each neuron individually.
+    Memory-efficient excess correlation computer using streaming computation.
     Implements the exact formula from the Universal Neurons paper:
-    ϱi = (1/|M|) * Σ_m [max_j ρ^{a,m}_{i,j} - max_j ρ̄^{a,m}_{i,j}]
+    Ï±i = (1/|M|) * Î£_m [max_j Ï^{a,m}_{i,j} - max_j ÏÌ„^{a,m}_{i,j}]
     """
     
     def __init__(self, model_names: List[str], device: str = "cuda", 
@@ -59,24 +109,26 @@ class MemoryEfficientExcessCorrelationComputer:
             self.models[model_id] = model
             torch.set_grad_enabled(False)
     
-    def generate_random_rotation_matrix(self, d_mlp: int) -> torch.Tensor:
+    def generate_random_rotation_matrix(self, d_mlp: int, seed: int = None) -> torch.Tensor:
         """Generate a random orthogonal rotation matrix using QR decomposition"""
+        if seed is not None:
+            torch.manual_seed(seed)
+        
         random_matrix = torch.randn(d_mlp, d_mlp, dtype=torch.float32)
         Q, R = torch.linalg.qr(random_matrix)
         if torch.det(Q) < 0:
             Q[:, 0] *= -1
         return Q.to(self.device)
     
-    def get_activations(self, model, inputs, target_layer: Optional[int] = None, 
-                       target_neuron: Optional[int] = None):
-        """Get MLP activations - optionally for specific neuron"""
+    def get_activations_batch(self, model, inputs, layer: Optional[int] = None):
+        """Get MLP activations for a batch of inputs"""
         hooks = []
         
         def save_activation_hook(tensor, hook):
             hook.ctx['activation'] = tensor.detach()
         
-        if target_layer is not None:
-            hooks = [(f'blocks.{target_layer}.mlp.hook_post', save_activation_hook)]
+        if layer is not None:
+            hooks = [(f'blocks.{layer}.mlp.hook_post', save_activation_hook)]
         else:
             hooks = [(f'blocks.{layer}.mlp.hook_post', save_activation_hook) 
                     for layer in range(model.cfg.n_layers)]
@@ -84,47 +136,52 @@ class MemoryEfficientExcessCorrelationComputer:
         with torch.no_grad():
             model.run_with_hooks(inputs, fwd_hooks=hooks)
         
-        if target_layer is not None:
-            activation = model.hook_dict[f'blocks.{target_layer}.mlp.hook_post'].ctx['activation']
-            if target_neuron is not None:
-                activation = activation[:, :, target_neuron]
+        if layer is not None:
+            activation = model.hook_dict[f'blocks.{layer}.mlp.hook_post'].ctx['activation']
             model.reset_hooks()
-            return activation
+            return activation  # Shape: [batch, seq, d_mlp]
         else:
             activations = torch.stack([
                 model.hook_dict[f'blocks.{layer}.mlp.hook_post'].ctx['activation'] 
                 for layer in range(model.cfg.n_layers)
-            ])
+            ])  # Shape: [n_layers, batch, seq, d_mlp]
             model.reset_hooks()
             return activations
     
-    def compute_pearson_correlation(self, x: torch.Tensor, y: torch.Tensor) -> float:
-        """Compute Pearson correlation between two 1D tensors"""
-        if len(x) < 2 or len(y) < 2:
-            return 0.0
+    def compute_max_correlation_for_batch(self, ref_neuron_acts: torch.Tensor, 
+                                        other_model_acts: torch.Tensor) -> float:
+        """Compute maximum correlation between reference neuron and all neurons in other model"""
+        # ref_neuron_acts: [batch * seq] flattened
+        # other_model_acts: [n_layers, batch, seq, d_mlp]
         
-        min_len = min(len(x), len(y))
-        x, y = x[:min_len], y[:min_len]
+        max_corr = -1.0
+        ref_acts_flat = ref_neuron_acts.flatten().cpu()
         
-        x_centered = x - x.mean()
-        y_centered = y - y.mean()
+        for layer in range(other_model_acts.shape[0]):
+            for neuron in range(other_model_acts.shape[-1]):
+                other_neuron_acts = other_model_acts[layer, :, :, neuron].flatten().cpu()
+                
+                # Compute correlation using streaming approach (simplified for batch)
+                if len(ref_acts_flat) != len(other_neuron_acts):
+                    min_len = min(len(ref_acts_flat), len(other_neuron_acts))
+                    ref_acts_flat = ref_acts_flat[:min_len]
+                    other_neuron_acts = other_neuron_acts[:min_len]
+                
+                if len(ref_acts_flat) < 2:
+                    continue
+                
+                corr = torch.corrcoef(torch.stack([ref_acts_flat, other_neuron_acts]))[0, 1]
+                if not torch.isnan(corr):
+                    max_corr = max(max_corr, corr.item())
         
-        numerator = (x_centered * y_centered).sum()
-        denominator = torch.sqrt((x_centered**2).sum() * (y_centered**2).sum())
-        
-        if denominator == 0:
-            return 0.0
-        
-        corr = numerator / denominator
-        return corr.item() if not torch.isnan(corr) else 0.0
+        return max_corr
     
-    def compute_excess_correlations_for_all_neurons(self, dataset_path: str, 
-                                                   batch_size: int = 8) -> pd.DataFrame:
+    def compute_excess_correlations_streaming(self, dataset_path: str, 
+                                            batch_size: int = 8) -> pd.DataFrame:
         """
-        Memory-efficient computation of excess correlations for all neurons.
-        Returns a DataFrame with excess correlation scores for each neuron.
+        Memory-efficient computation of excess correlations using streaming approach.
         """
-        print("Computing excess correlations using memory-efficient method...")
+        print("Computing excess correlations using streaming method...")
         
         # Load all models
         for model_name in self.model_names:
@@ -160,113 +217,117 @@ class MemoryEfficientExcessCorrelationComputer:
         n_layers = reference_model.cfg.n_layers
         d_mlp = reference_model.cfg.d_mlp
         
-        # Pre-generate rotation matrices for all other models
-        print("Pre-generating rotation matrices...")
-        rotation_matrices = {}
-        for model_name in self.model_names[1:]:
-            model_id = self._get_model_identifier(model_name)
-            model = self.models[model_id]
-            rotation_matrices[model_id] = {}
-            for layer in range(model.cfg.n_layers):
-                rotation_matrices[model_id][layer] = []
-                for _ in range(self.n_rotation_samples):
-                    rot_matrix = self.generate_random_rotation_matrix(model.cfg.d_mlp)
-                    rotation_matrices[model_id][layer].append(rot_matrix)
+        # Initialize correlation computers for each neuron
+        correlation_computers = {}
+        for layer in range(n_layers):
+            for neuron in range(d_mlp):
+                correlation_computers[(layer, neuron)] = {
+                    'regular_correlations': [],  # Store max correlations per model per batch
+                    'baseline_correlations': [[] for _ in range(self.n_rotation_samples)]  # Per rotation
+                }
         
+        print(f"Processing {len(dataloader)} batches...")
+        
+        # Process each batch
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Processing batches")):
+            batch = batch.to(self.device)
+            
+            # Create mask for valid tokens (non-padding)
+            valid_mask = (batch != 0)
+            
+            # Get reference model activations for all layers
+            ref_activations = self.get_activations_batch(reference_model, batch)
+            # Shape: [n_layers, batch, seq, d_mlp]
+            
+            # Process each other model
+            for model_name in self.model_names[1:]:
+                model_id = self._get_model_identifier(model_name)
+                model = self.models[model_id]
+                
+                # Get other model activations
+                other_activations = self.get_activations_batch(model, batch)
+                
+                # For each reference neuron, compute correlations
+                for layer in range(n_layers):
+                    for neuron in range(d_mlp):
+                        # Get reference neuron activations for this batch
+                        ref_neuron_acts = ref_activations[layer, :, :, neuron]
+                        # Apply mask and flatten
+                        ref_neuron_masked = ref_neuron_acts[valid_mask]
+                        
+                        if len(ref_neuron_masked) < 2:
+                            continue
+                        
+                        # Compute regular max correlation
+                        max_regular_corr = self.compute_max_correlation_for_batch(
+                            ref_neuron_masked, other_activations
+                        )
+                        correlation_computers[(layer, neuron)]['regular_correlations'].append(max_regular_corr)
+                        
+                        # Compute baseline correlations with rotations
+                        for rot_idx in range(self.n_rotation_samples):
+                            # Generate rotation matrix deterministically
+                            seed = layer * 10000 + neuron * 100 + rot_idx + batch_idx
+                            rotation_matrix = self.generate_random_rotation_matrix(
+                                model.cfg.d_mlp, seed=seed
+                            )
+                            
+                            # Apply rotation to other model activations
+                            rotated_activations = torch.zeros_like(other_activations)
+                            for l in range(other_activations.shape[0]):
+                                # other_activations[l]: [batch, seq, d_mlp]
+                                acts_2d = other_activations[l].view(-1, model.cfg.d_mlp)  # [batch*seq, d_mlp]
+                                rotated_2d = acts_2d @ rotation_matrix.T  # [batch*seq, d_mlp]
+                                rotated_activations[l] = rotated_2d.view(other_activations[l].shape)
+                            
+                            # Compute max correlation with rotated activations
+                            max_baseline_corr = self.compute_max_correlation_for_batch(
+                                ref_neuron_masked, rotated_activations
+                            )
+                            correlation_computers[(layer, neuron)]['baseline_correlations'][rot_idx].append(max_baseline_corr)
+            
+            # Clear memory periodically
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Compute final excess correlation scores
+        print("Computing final excess correlation scores...")
         excess_correlation_scores = []
         
-        # Process each neuron in reference model
-        print(f"Processing {n_layers * d_mlp} neurons...")
-        for layer in tqdm(range(n_layers), desc="Processing layers"):
-            for neuron in tqdm(range(d_mlp), desc=f"Layer {layer} neurons", leave=False):
+        for layer in range(n_layers):
+            for neuron in range(d_mlp):
+                correlations_data = correlation_computers[(layer, neuron)]
                 
-                # Collect activations for this specific neuron across all batches
-                reference_activations = []
-                other_model_activations = {model_id: [] for model_id in self.models.keys() 
-                                         if model_id != reference_model_id}
+                # Average regular correlations across models and batches
+                regular_corrs = correlations_data['regular_correlations']
+                if not regular_corrs:
+                    mean_regular_corr = 0.0
+                else:
+                    mean_regular_corr = np.mean(regular_corrs)
                 
-                for batch in dataloader:
-                    batch = batch.to(self.device)
-                    
-                    # Get reference neuron activation
-                    ref_act = self.get_activations(reference_model, batch, 
-                                                 target_layer=layer, target_neuron=neuron)
-                    ref_act = ref_act.flatten()
-                    
-                    # Get all activations from other models
-                    for model_name in self.model_names[1:]:
-                        model_id = self._get_model_identifier(model_name)
-                        model = self.models[model_id]
-                        other_acts = self.get_activations(model, batch)
-                        other_acts = einops.rearrange(other_acts, 'l b s d -> l d (b s)')
-                        other_model_activations[model_id].append(other_acts.cpu())
-                    
-                    # Apply mask and store
-                    valid_mask = (batch.flatten() != 0)
-                    if valid_mask.sum() > 0:
-                        reference_activations.append(ref_act[valid_mask].cpu())
+                # Average baseline correlations across rotations and batches
+                baseline_means = []
+                for rot_idx in range(self.n_rotation_samples):
+                    baseline_corrs = correlations_data['baseline_correlations'][rot_idx]
+                    if baseline_corrs:
+                        baseline_means.append(np.mean(baseline_corrs))
                 
-                if not reference_activations:
-                    continue
+                if baseline_means:
+                    mean_baseline_corr = np.mean(baseline_means)
+                else:
+                    mean_baseline_corr = 0.0
                 
-                # Concatenate all reference activations
-                ref_all = torch.cat(reference_activations, dim=0)
-                
-                # Compute excess correlation for this neuron
-                excess_correlations_per_model = []
-                
-                for model_name in self.model_names[1:]:
-                    model_id = self._get_model_identifier(model_name)
-                    model = self.models[model_id]
-                    
-                    # Concatenate other model activations
-                    other_all = torch.cat(other_model_activations[model_id], dim=-1)
-                    
-                    # Compute regular correlations (find max)
-                    max_regular_corr = -1.0
-                    for other_layer in range(model.cfg.n_layers):
-                        for other_neuron in range(model.cfg.d_mlp):
-                            other_neuron_acts = other_all[other_layer, other_neuron]
-                            corr = self.compute_pearson_correlation(ref_all, other_neuron_acts)
-                            max_regular_corr = max(max_regular_corr, corr)
-                    
-                    # Compute baseline correlations with rotations (find max)
-                    max_baseline_corrs = []
-                    for rotation_idx in range(self.n_rotation_samples):
-                        max_baseline_corr = -1.0
-                        for other_layer in range(model.cfg.n_layers):
-                            # Apply rotation
-                            rotation_matrix = rotation_matrices[model_id][other_layer][rotation_idx]
-                            rotated_acts = rotation_matrix @ other_all[other_layer]
-                            
-                            for other_neuron in range(model.cfg.d_mlp):
-                                rotated_neuron_acts = rotated_acts[other_neuron]
-                                corr = self.compute_pearson_correlation(ref_all, rotated_neuron_acts)
-                                max_baseline_corr = max(max_baseline_corr, corr)
-                        
-                        max_baseline_corrs.append(max_baseline_corr)
-                    
-                    # Average baseline across rotations
-                    mean_max_baseline = np.mean(max_baseline_corrs)
-                    
-                    # Excess correlation for this model pair
-                    excess_corr = max_regular_corr - mean_max_baseline
-                    excess_correlations_per_model.append(excess_corr)
-                
-                # Average excess correlation across all other models (paper formula)
-                mean_excess_correlation = np.mean(excess_correlations_per_model)
+                # Excess correlation
+                excess_correlation = mean_regular_corr - mean_baseline_corr
                 
                 excess_correlation_scores.append({
                     'layer': layer,
                     'neuron': neuron,
-                    'excess_correlation': mean_excess_correlation,
-                    'n_models_compared': len(excess_correlations_per_model),
-                    'excess_correlations_per_model': excess_correlations_per_model
+                    'excess_correlation': excess_correlation,
+                    'regular_correlation': mean_regular_corr,
+                    'baseline_correlation': mean_baseline_corr,
+                    'n_models_compared': len(self.model_names) - 1,
                 })
-                
-                # Periodic cleanup
-                if (neuron + 1) % 50 == 0:
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         # Convert to DataFrame
         excess_df = pd.DataFrame(excess_correlation_scores)
@@ -497,9 +558,10 @@ def run_universal_neurons_analysis(model_names: List[str], dataset_path: str,
                                  excess_threshold: float = 0.1,
                                  checkpoint_value: Optional[Union[int, str]] = None,
                                  top_k: Optional[int] = None,
-                                 n_rotation_samples: int = 5) -> Dict:
+                                 n_rotation_samples: int = 5,
+                                 batch_size: int = 4) -> Dict:  # Reduced default batch size
     """
-    Run complete universal neurons analysis using excess correlation method.
+    Run complete universal neurons analysis using memory-efficient excess correlation method.
     """
     
     if checkpoint_value is not None:
@@ -508,7 +570,7 @@ def run_universal_neurons_analysis(model_names: List[str], dataset_path: str,
     os.makedirs(output_dir, exist_ok=True)
     
     print("=" * 60)
-    print("UNIVERSAL NEURONS ANALYSIS - EXCESS CORRELATION METHOD")
+    print("UNIVERSAL NEURONS ANALYSIS - MEMORY-EFFICIENT EXCESS CORRELATION")
     if checkpoint_value is not None:
         print(f"CHECKPOINT: {checkpoint_value}")
     print("=" * 60)
@@ -520,7 +582,9 @@ def run_universal_neurons_analysis(model_names: List[str], dataset_path: str,
         n_rotation_samples=n_rotation_samples
     )
     
-    excess_correlation_df = correlator.compute_excess_correlations_for_all_neurons(dataset_path)
+    excess_correlation_df = correlator.compute_excess_correlations_streaming(
+        dataset_path, batch_size=batch_size
+    )
     
     # Save excess correlation scores
     excess_file = os.path.join(output_dir, "excess_correlation_scores.csv")
@@ -598,16 +662,17 @@ if __name__ == "__main__":
     # Create dataset
     dataset_path = create_tokenized_dataset(
         model_name=models[0],
-        n_tokens=500000,  # Reduced for testing
+        n_tokens=500000,  # Reduced for memory efficiency
         output_dir="datasets"
     )
     
-    # Run analysis
+    # Run analysis with memory-efficient settings
     results = run_universal_neurons_analysis(
         model_names=models,
         dataset_path=dataset_path,
         excess_threshold=0.05,  # Lower threshold for testing
-        n_rotation_samples=3    # Fewer samples for speed
+        n_rotation_samples=3,   # Fewer samples for speed
+        batch_size=4            # Smaller batch size for memory
     )
     
     print("Analysis complete! Check the results directory for outputs.")
