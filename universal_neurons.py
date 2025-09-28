@@ -1,6 +1,6 @@
 """
-Universal Neurons Analysis - Efficient Implementation using Repository's Method
-This implements the fast correlation computation approach from the original repository.
+Universal Neurons Analysis - Fixed Efficient Implementation
+This implements the fast correlation computation approach with proper efficiency and device handling.
 """
 
 import os
@@ -21,8 +21,7 @@ import seaborn as sns
 
 class StreamingPearsonComputer:
     """
-    Fast streaming correlation computer from the repository.
-    Computes full correlation matrices efficiently.
+    Fast streaming correlation computer with proper device handling.
     """
     def __init__(self, model_1, model_2, device='cpu'):
         m1_layers = model_1.cfg.n_layers
@@ -31,6 +30,7 @@ class StreamingPearsonComputer:
         m2_dmlp = model_2.cfg.d_mlp
         self.device = device
 
+        # Initialize all tensors on the correct device
         self.m1_sum = torch.zeros(
             (m1_layers, m1_dmlp), dtype=torch.float64, device=device)
         self.m1_sum_sq = torch.zeros(
@@ -48,21 +48,23 @@ class StreamingPearsonComputer:
         self.n = 0
 
     def update_correlation_data(self, batch_1_acts, batch_2_acts):
-        """Update correlation statistics with new batch"""
+        """Update correlation statistics with new batch - fixed device handling"""
+        # Ensure all tensors are on the same device
+        batch_1_acts = batch_1_acts.to(self.device, dtype=torch.float64)
+        batch_2_acts = batch_2_acts.to(self.device, dtype=torch.float64)
+        
         for l1 in range(batch_1_acts.shape[0]):
-            batch_1_acts_l1 = batch_1_acts[l1].to(torch.float32)
-
             for l2 in range(batch_2_acts.shape[0]):
                 layerwise_result = einops.einsum(
-                    batch_1_acts_l1, batch_2_acts[l2].to(torch.float32), 
+                    batch_1_acts[l1], batch_2_acts[l2], 
                     'n1 t, n2 t -> n1 n2'
                 )
-                self.m1_m2_sum[l1, :, l2, :] += layerwise_result.cpu()
+                self.m1_m2_sum[l1, :, l2, :] += layerwise_result
 
-        self.m1_sum += batch_1_acts.sum(dim=-1).cpu()
-        self.m1_sum_sq += (batch_1_acts**2).sum(dim=-1).cpu()
-        self.m2_sum += batch_2_acts.sum(dim=-1).cpu()
-        self.m2_sum_sq += (batch_2_acts**2).sum(dim=-1).cpu()
+        self.m1_sum += batch_1_acts.sum(dim=-1)
+        self.m1_sum_sq += (batch_1_acts**2).sum(dim=-1)
+        self.m2_sum += batch_2_acts.sum(dim=-1)
+        self.m2_sum_sq += (batch_2_acts**2).sum(dim=-1)
 
         self.n += batch_1_acts.shape[-1]
 
@@ -80,7 +82,8 @@ class StreamingPearsonComputer:
             l_correlation = numerator / einops.einsum(
                 m1_norm, m2_norm, 'n1, l2 n2 -> n1 l2 n2'
             )
-            layer_correlations.append(l_correlation.to(torch.float16))
+            # Keep on device for now
+            layer_correlations.append(l_correlation.to(torch.float32))
 
         correlation = torch.stack(layer_correlations, dim=0)
         return correlation
@@ -147,9 +150,7 @@ def generate_random_rotation_matrix(d_mlp: int, device: str = "cpu", seed: int =
 
 class EfficientExcessCorrelationComputer:
     """
-    Efficient excess correlation computer using the repository's approach:
-    1. Compute all correlations first
-    2. Calculate excess correlation from correlation matrices
+    Fixed efficient excess correlation computer that computes each correlation matrix only once.
     """
     
     def __init__(self, model_names: List[str], device: str = "cuda", 
@@ -223,9 +224,7 @@ class EfficientExcessCorrelationComputer:
                 model_b.cfg.d_mlp, device=self.device, seed=rotation_seed
             )
         
-        print(f"Computing correlations between {model_a_name} and {model_b_name}...")
-        
-        for batch in tqdm(dataloader, desc="Processing batches"):
+        for batch in tqdm(dataloader, desc="Processing batches", leave=False):
             batch = batch.to(self.device)
             
             # Get activations
@@ -247,17 +246,17 @@ class EfficientExcessCorrelationComputer:
         # Compute final correlation matrix
         correlation_matrix = corr_computer.compute_correlation()
         
-        # Clear memory
+        # Move to CPU for storage
+        correlation_matrix = correlation_matrix.cpu()
+        
+        # Clear GPU memory
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         return correlation_matrix
     
     def compute_excess_correlations(self, dataset_path: str, batch_size: int = 8) -> pd.DataFrame:
         """
-        Compute excess correlations using the repository's method:
-        1. Compute all regular correlations
-        2. Compute baseline correlations with rotations
-        3. Calculate excess = regular - baseline
+        FIXED: Compute excess correlations efficiently - compute each correlation matrix only once.
         """
         
         if len(self.model_names) < 2:
@@ -274,54 +273,62 @@ class EfficientExcessCorrelationComputer:
         n_layers = ref_model.cfg.n_layers
         d_mlp = ref_model.cfg.d_mlp
         
+        # STEP 1: Compute all correlation matrices once
+        print("Step 1: Computing regular correlation matrices...")
+        regular_correlations = {}
+        for comp_model in comparison_models:
+            print(f"  Computing regular correlation: {reference_model} vs {comp_model}")
+            regular_correlations[comp_model] = self.compute_correlation_matrix(
+                reference_model, comp_model, dataset_path, batch_size, 
+                apply_rotation=False
+            )
+        
+        # STEP 2: Compute all baseline correlation matrices
+        print("Step 2: Computing baseline correlation matrices...")
+        baseline_correlations = {}
+        for comp_model in comparison_models:
+            baseline_correlations[comp_model] = []
+            for rot_idx in range(self.n_rotation_samples):
+                print(f"  Computing baseline correlation: {reference_model} vs {comp_model}, rotation {rot_idx+1}/{self.n_rotation_samples}")
+                rotation_seed = hash((reference_model, comp_model, rot_idx)) % (2**31)
+                baseline_corr = self.compute_correlation_matrix(
+                    reference_model, comp_model, dataset_path, batch_size,
+                    apply_rotation=True, rotation_seed=rotation_seed
+                )
+                baseline_correlations[comp_model].append(baseline_corr)
+        
+        # STEP 3: Extract excess correlations for all neurons from pre-computed matrices
+        print("Step 3: Computing excess correlations from matrices...")
         excess_correlation_scores = []
         
-        # Process each neuron in the reference model
-        for layer in range(n_layers):
+        for layer in tqdm(range(n_layers), desc="Processing layers"):
             for neuron in range(d_mlp):
-                print(f"Processing neuron {layer}.{neuron}")
                 
-                regular_correlations = []
-                baseline_correlations = []
+                regular_max_corrs = []
+                baseline_max_corrs = []
                 
-                # Compute correlations with each comparison model
+                # Extract correlations for this neuron from all pre-computed matrices
                 for comp_model in comparison_models:
                     
-                    # Regular correlation
-                    print(f"  Computing regular correlation with {comp_model}")
-                    regular_corr_matrix = self.compute_correlation_matrix(
-                        reference_model, comp_model, dataset_path, batch_size, 
-                        apply_rotation=False
-                    )
-                    
-                    # Extract max correlation for this neuron
-                    neuron_corrs = regular_corr_matrix[layer, neuron, :, :].flatten()
+                    # Regular correlation: max across all neurons in comparison model
+                    reg_corr_matrix = regular_correlations[comp_model]
+                    neuron_corrs = reg_corr_matrix[layer, neuron, :, :].flatten()
                     max_regular_corr = torch.max(neuron_corrs).item()
-                    regular_correlations.append(max_regular_corr)
+                    regular_max_corrs.append(max_regular_corr)
                     
-                    # Baseline correlations with rotations
+                    # Baseline correlations: average across rotations
                     rotation_max_corrs = []
-                    for rot_idx in range(self.n_rotation_samples):
-                        print(f"  Computing baseline correlation {rot_idx+1}/{self.n_rotation_samples}")
-                        
-                        rotation_seed = layer * 10000 + neuron * 100 + rot_idx
-                        baseline_corr_matrix = self.compute_correlation_matrix(
-                            reference_model, comp_model, dataset_path, batch_size,
-                            apply_rotation=True, rotation_seed=rotation_seed
-                        )
-                        
-                        # Extract max correlation for this neuron
+                    for baseline_corr_matrix in baseline_correlations[comp_model]:
                         neuron_baseline_corrs = baseline_corr_matrix[layer, neuron, :, :].flatten()
                         max_baseline_corr = torch.max(neuron_baseline_corrs).item()
                         rotation_max_corrs.append(max_baseline_corr)
                     
-                    # Average baseline across rotations
                     avg_baseline_corr = np.mean(rotation_max_corrs)
-                    baseline_correlations.append(avg_baseline_corr)
+                    baseline_max_corrs.append(avg_baseline_corr)
                 
                 # Average across comparison models
-                mean_regular_corr = np.mean(regular_correlations)
-                mean_baseline_corr = np.mean(baseline_correlations)
+                mean_regular_corr = np.mean(regular_max_corrs)
+                mean_baseline_corr = np.mean(baseline_max_corrs)
                 
                 # Excess correlation
                 excess_correlation = mean_regular_corr - mean_baseline_corr
