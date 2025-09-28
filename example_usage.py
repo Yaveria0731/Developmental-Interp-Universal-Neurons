@@ -194,7 +194,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, help="Specific checkpoint to analyze")
     parser.add_argument("--compare-checkpoints", nargs='+', type=int, 
                        help="Compare multiple checkpoints (e.g., --compare-checkpoints 1000 5000 10000)")
-    parser.add_argument("--excess-threshold", type=float, default=0.1,
+    parser.add_argument("--excess-threshold", type=float, default=0.5,
                        help="Excess correlation threshold for identifying universal neurons")
     parser.add_argument("--memory-test", action="store_true", 
                        help="Run memory stress test with minimal settings")
