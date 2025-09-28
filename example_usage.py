@@ -6,7 +6,7 @@ Demonstrates how to use the streamlined excess correlation method.
 
 import argparse
 from pathlib import Path
-from universal_neurons_clean import (
+from universal_neurons import (
     create_tokenized_dataset,
     run_universal_neurons_analysis,
     MemoryEfficientExcessCorrelationComputer,
