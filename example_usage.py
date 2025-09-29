@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Example Usage: Efficient Universal Neurons Analysis
-Demonstrates how to use the efficient excess correlation method.
+Example Usage: Repository-Compatible Universal Neurons Analysis
+Demonstrates the two-step pipeline matching the original repository structure.
 """
 
 import argparse
 from pathlib import Path
 from universal_neurons import (
     create_tokenized_dataset,
+    run_correlation_analysis,
     run_universal_neurons_analysis,
-    EfficientExcessCorrelationComputer,
-    UniversalNeuronAnalyzer
+    run_full_pipeline,
+    CorrelationComputer,
+    ExcessCorrelationComputer,
+    UniversalNeuronAnalyzer,
+    NeuronStatsGenerator
 )
 
 
@@ -29,15 +33,14 @@ def quick_test(checkpoint_value=None):
         output_dir="test_datasets"
     )
     
-    # Run analysis with relaxed parameters for speed
-    results = run_universal_neurons_analysis(
+    # Run full pipeline with test settings
+    results = run_full_pipeline(
         model_names=test_models,
         dataset_path=dataset_path,
         output_dir="test_results",
         excess_threshold=0.02,  # Lower threshold for testing
         checkpoint_value=checkpoint_value,
-        n_rotation_samples=2,   # Fewer samples for speed
-        batch_size=8            # Reasonable batch size for testing
+        batch_size=8
     )
     
     print("Quick test completed! Check test_results/ directory.")
@@ -65,18 +68,73 @@ def full_analysis(checkpoint_value=None):
         output_dir="datasets"
     )
     
-    # Run full analysis
+    # Run full pipeline
+    results = run_full_pipeline(
+        model_names=models,
+        dataset_path=dataset_path,
+        output_dir="universal_neurons_results",
+        excess_threshold=0.1,
+        checkpoint_value=checkpoint_value,
+        batch_size=8
+    )
+    
+    print("Full analysis completed! Check universal_neurons_results/ directory.")
+    return results
+
+
+def correlation_only(checkpoint_value=None):
+    """Run only correlation analysis step"""
+    print("Running correlation analysis only...")
+    
+    models = [
+        "stanford-crfm/alias-gpt2-small-x21",
+        "stanford-crfm/battlestar-gpt2-small-x49",
+        "stanford-crfm/caprica-gpt2-small-x81"
+    ]
+    
+    # Create dataset
+    dataset_path = create_tokenized_dataset(
+        model_name=models[0],
+        n_tokens=500_000,
+        output_dir="datasets"
+    )
+    
+    # Run only correlation analysis
+    correlation_dir = run_correlation_analysis(
+        model_names=models,
+        dataset_path=dataset_path,
+        checkpoint_value=checkpoint_value,
+        batch_size=8
+    )
+    
+    print(f"Correlation analysis completed! Results saved to: {correlation_dir}")
+    return correlation_dir
+
+
+def universal_neurons_only(correlation_results_dir="correlation_results", checkpoint_value=None):
+    """Run only universal neurons analysis from existing correlations"""
+    print("Running universal neurons analysis from existing correlations...")
+    
+    models = [
+        "stanford-crfm/alias-gpt2-small-x21",
+        "stanford-crfm/battlestar-gpt2-small-x49", 
+        "stanford-crfm/caprica-gpt2-small-x81"
+    ]
+    
+    # Create dataset path (should already exist from correlation step)
+    dataset_path = f"datasets/stanford-crfm_alias-gpt2-small-x21/pile"
+    
+    # Run universal neurons analysis
     results = run_universal_neurons_analysis(
         model_names=models,
         dataset_path=dataset_path,
         output_dir="universal_neurons_results",
         excess_threshold=0.1,
         checkpoint_value=checkpoint_value,
-        n_rotation_samples=5,
-        batch_size=8
+        correlation_results_dir=correlation_results_dir
     )
     
-    print("Full analysis completed! Check universal_neurons_results/ directory.")
+    print("Universal neurons analysis completed!")
     return results
 
 
@@ -93,7 +151,7 @@ def analyze_checkpoint_progression(checkpoints):
     # Create dataset once
     dataset_path = create_tokenized_dataset(
         model_name=models[0],
-        n_tokens=500_000,  # 500K tokens for checkpoint analysis
+        n_tokens=500_000,
         output_dir="datasets"
     )
     
@@ -102,13 +160,12 @@ def analyze_checkpoint_progression(checkpoints):
     for checkpoint in checkpoints:
         print(f"\nAnalyzing checkpoint {checkpoint}...")
         
-        results = run_universal_neurons_analysis(
+        results = run_full_pipeline(
             model_names=models,
             dataset_path=dataset_path,
-            output_dir=f"checkpoint_analysis",
+            output_dir=f"checkpoint_analysis_checkpoint_{checkpoint}",
             excess_threshold=0.05,
             checkpoint_value=checkpoint,
-            n_rotation_samples=3,
             batch_size=8
         )
         
@@ -161,32 +218,6 @@ def analyze_checkpoint_progression(checkpoints):
     return checkpoint_results
 
 
-def memory_efficient_test():
-    """Test with minimal memory footprint for very large models"""
-    print("Running memory efficient test...")
-    
-    models = ["gpt2", "distilgpt2"]
-    
-    dataset_path = create_tokenized_dataset(
-        model_name="gpt2",
-        n_tokens=100000,  # Small dataset
-        ctx_len=256,      # Short sequences
-        output_dir="memory_test_datasets"
-    )
-    
-    results = run_universal_neurons_analysis(
-        model_names=models,
-        dataset_path=dataset_path,
-        output_dir="memory_test_results",
-        excess_threshold=0.01,
-        n_rotation_samples=2,  # Minimal rotations
-        batch_size=4           # Small batch size
-    )
-    
-    print("Memory efficient test completed!")
-    return results
-
-
 def custom_analysis_example():
     """Example of using the classes directly for custom analysis"""
     print("Running custom analysis example...")
@@ -200,20 +231,32 @@ def custom_analysis_example():
         output_dir="custom_datasets"
     )
     
-    # Initialize excess correlation computer
-    correlator = EfficientExcessCorrelationComputer(
-        model_names=models,
-        n_rotation_samples=3
+    # Step 1: Compute correlations manually
+    print("Step 1: Computing correlations...")
+    correlator = CorrelationComputer()
+    
+    # Compute regular correlation
+    correlator.run_correlation_experiment(
+        models[0], models[1], dataset_path,
+        batch_size=4, baseline='none',
+        output_dir="custom_correlations"
     )
     
-    # Compute excess correlations
-    print("Computing excess correlations...")
-    excess_df = correlator.compute_excess_correlations(
-        dataset_path=dataset_path,
-        batch_size=4
+    # Compute baseline correlation
+    correlator.run_correlation_experiment(
+        models[0], models[1], dataset_path,
+        batch_size=4, baseline='rotation',
+        output_dir="custom_correlations"
     )
     
-    # Analyze results
+    # Step 2: Compute excess correlations from saved matrices
+    print("Step 2: Computing excess correlations...")
+    excess_computer = ExcessCorrelationComputer("custom_correlations")
+    
+    dataset_name = "pile"  # basename of dataset_path
+    excess_df = excess_computer.compute_excess_correlations_from_saved(models, dataset_name)
+    
+    # Step 3: Analyze results
     analyzer = UniversalNeuronAnalyzer(excess_df)
     
     # Get top 10 neurons by excess correlation
@@ -225,104 +268,145 @@ def custom_analysis_example():
     threshold_neurons = analyzer.identify_universal_neurons(excess_threshold=0.05)
     print(f"\nFound {len(threshold_neurons)} neurons above threshold 0.05")
     
+    # Step 4: Compute neuron statistics
+    print("Step 3: Computing neuron statistics...")
+    stats_generator = NeuronStatsGenerator(models[0])
+    neuron_stats = stats_generator.compute_neuron_stats()
+    
     return {
         'excess_correlations': excess_df,
         'top_neurons': top_neurons,
-        'threshold_neurons': threshold_neurons
+        'threshold_neurons': threshold_neurons,
+        'neuron_stats': neuron_stats
     }
 
 
-def compare_models_example():
-    """Example comparing different model families"""
-    print("Running model comparison example...")
+def memory_efficient_test():
+    """Test with minimal memory footprint"""
+    print("Running memory efficient test...")
     
-    # Compare different model architectures
-    model_groups = [
-        ["gpt2", "distilgpt2"],  # GPT-2 family
-        # Add more model groups as needed
-    ]
+    models = ["gpt2", "distilgpt2"]
     
-    results_by_group = {}
+    dataset_path = create_tokenized_dataset(
+        model_name="gpt2",
+        n_tokens=50000,   # Very small dataset
+        ctx_len=256,      # Short sequences
+        output_dir="memory_test_datasets"
+    )
     
-    for i, models in enumerate(model_groups):
-        print(f"\nAnalyzing model group {i+1}: {models}")
-        
-        # Create dataset using first model in group
-        dataset_path = create_tokenized_dataset(
-            model_name=models[0],
-            n_tokens=100000,
-            output_dir=f"datasets_group_{i}"
-        )
-        
-        # Run analysis
-        results = run_universal_neurons_analysis(
-            model_names=models,
-            dataset_path=dataset_path,
-            output_dir=f"results_group_{i}",
-            excess_threshold=0.05,
-            n_rotation_samples=3,
-            batch_size=4
-        )
-        
-        results_by_group[f"group_{i}"] = {
-            'models': models,
-            'results': results
-        }
+    results = run_full_pipeline(
+        model_names=models,
+        dataset_path=dataset_path,
+        output_dir="memory_test_results",
+        excess_threshold=0.01,
+        batch_size=4      # Small batch size
+    )
     
-    # Compare results across groups
+    print("Memory efficient test completed!")
+    return results
+
+
+def two_step_example():
+    """Example demonstrating the two-step pipeline explicitly"""
+    print("Running two-step pipeline example...")
+    
+    models = ["gpt2", "distilgpt2"]
+    
+    # Create dataset
+    dataset_path = create_tokenized_dataset(
+        model_name="gpt2",
+        n_tokens=100000,
+        output_dir="two_step_datasets"
+    )
+    
+    # STEP 1: Compute correlations
     print("\n" + "="*50)
-    print("COMPARISON ACROSS MODEL GROUPS")
+    print("STEP 1: CORRELATION COMPUTATION")
     print("="*50)
     
-    for group_name, group_data in results_by_group.items():
-        models = group_data['models']
-        results = group_data['results']
-        n_universal = len(results['universal_neurons'])
-        
-        print(f"{group_name}: {models}")
-        print(f"  Universal neurons found: {n_universal}")
-        if n_universal > 0:
-            mean_excess = results['universal_neurons']['excess_correlation'].mean()
-            print(f"  Mean excess correlation: {mean_excess:.4f}")
-        print()
+    correlation_dir = run_correlation_analysis(
+        model_names=models,
+        dataset_path=dataset_path,
+        batch_size=4,
+        output_dir="two_step_correlations"
+    )
     
-    return results_by_group
+    # STEP 2: Compute universal neurons from saved correlations
+    print("\n" + "="*50)
+    print("STEP 2: UNIVERSAL NEURONS ANALYSIS")
+    print("="*50)
+    
+    results = run_universal_neurons_analysis(
+        model_names=models,
+        dataset_path=dataset_path,
+        output_dir="two_step_results",
+        excess_threshold=0.05,
+        correlation_results_dir=correlation_dir
+    )
+    
+    print("\nTwo-step pipeline completed!")
+    print(f"Correlation results: {correlation_dir}")
+    print(f"Universal neurons results: two_step_results")
+    
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Efficient Universal Neurons Analysis")
+    parser = argparse.ArgumentParser(description="Repository-Compatible Universal Neurons Analysis")
     parser.add_argument("--test", action="store_true", help="Run quick test with smaller models")
     parser.add_argument("--checkpoint", type=str, help="Specific checkpoint to analyze")
     parser.add_argument("--compare-checkpoints", nargs='+', type=int, 
                        help="Compare multiple checkpoints (e.g., --compare-checkpoints 1000 5000 10000)")
     parser.add_argument("--excess-threshold", type=float, default=0.1,
                        help="Excess correlation threshold for identifying universal neurons")
-    parser.add_argument("--memory-test", action="store_true", 
-                       help="Run memory efficient test")
     parser.add_argument("--batch-size", type=int, default=8,
                        help="Batch size for processing")
-    parser.add_argument("--n-rotations", type=int, default=5,
-                       help="Number of rotation samples for baseline")
+    
+    # Pipeline control arguments
+    parser.add_argument("--correlation-only", action="store_true",
+                       help="Run only correlation analysis step")
+    parser.add_argument("--universal-only", action="store_true",
+                       help="Run only universal neurons analysis from existing correlations")
+    parser.add_argument("--correlation-dir", type=str, default="correlation_results",
+                       help="Directory with existing correlation results")
+    
+    # Example arguments
+    parser.add_argument("--memory-test", action="store_true", 
+                       help="Run memory efficient test")
     parser.add_argument("--custom", action="store_true",
                        help="Run custom analysis example")
-    parser.add_argument("--compare-models", action="store_true",
-                       help="Run model comparison example")
+    parser.add_argument("--two-step", action="store_true",
+                       help="Run two-step pipeline example")
     
     args = parser.parse_args()
     
+    # Parse checkpoint
+    checkpoint = None
+    if args.checkpoint:
+        try:
+            checkpoint = int(args.checkpoint)
+        except ValueError:
+            checkpoint = args.checkpoint
+    
+    # Execute based on arguments
     if args.memory_test:
         print("Running memory efficient test...")
         memory_efficient_test()
         
     elif args.test:
         print("Running in test mode...")
-        checkpoint = None
-        if args.checkpoint:
-            try:
-                checkpoint = int(args.checkpoint)
-            except ValueError:
-                checkpoint = args.checkpoint
         quick_test(checkpoint_value=checkpoint)
+        
+    elif args.correlation_only:
+        print("Running correlation analysis only...")
+        correlation_only(checkpoint_value=checkpoint)
+        
+    elif args.universal_only:
+        print("Running universal neurons analysis only...")
+        universal_neurons_only(
+            correlation_results_dir=args.correlation_dir,
+            checkpoint_value=checkpoint
+        )
         
     elif args.compare_checkpoints:
         print("Running checkpoint comparison analysis...")
@@ -332,18 +416,12 @@ def main():
         print("Running custom analysis example...")
         custom_analysis_example()
         
-    elif args.compare_models:
-        print("Running model comparison example...")
-        compare_models_example()
+    elif args.two_step:
+        print("Running two-step pipeline example...")
+        two_step_example()
         
     else:
         print("Running full analysis...")
-        checkpoint = None
-        if args.checkpoint:
-            try:
-                checkpoint = int(args.checkpoint)
-            except ValueError:
-                checkpoint = args.checkpoint
         full_analysis(checkpoint_value=checkpoint)
 
 
