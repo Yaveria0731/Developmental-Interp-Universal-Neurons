@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.abspath("."))
 import numpy as np
 # 2) Then add your project root if you still need it:
-PROJECT_ROOT = "/content/universal-neurons-new"
+PROJECT_ROOT = ""
 sys.path.insert(1, PROJECT_ROOT)
 
 import argparse
@@ -141,7 +141,7 @@ if __name__ == '__main__':
     no_c = make_neuron_stat_df(args.model_1_name, args.token_dataset, args.checkpoint)
     c = make_correlation_result_df(args.model_1_name, args.model_2_name, args.token_dataset, f'{args.similarity_type}.none', f'{args.similarity_type}.{args.baseline}', result_dir='correlation_results')
     combined_df = pd.concat([no_c, c], axis=1)
-    combined_df.to_csv('combined_neuron_stats.csv', index=False)
+    combined_df.to_csv(f'combined_neuron_stats{args.model_1_name.replace('/', '_')}_{args.model_2_name.replace('/', '_')}.csv', index=True)
     
 
   

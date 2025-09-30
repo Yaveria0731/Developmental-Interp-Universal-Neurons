@@ -14,8 +14,6 @@ def load_correlation_results(
         model_1_name, model_2_name, dataset, correlation_computation,
         return_np=False, result_dir='correlation_results'):
     file_path = os.path.join(
-        "/content",
-        "universal-neurons-new",
         result_dir,
         f'{model_1_name}+{model_2_name}',
         dataset,
@@ -87,8 +85,9 @@ def summarize_correlation_matrix(correlation_matrix):
 
 
 def make_correlation_result_df(model_a, model_b, dataset, metric, baseline_metric, result_dir='correlation_results'):
+    # print("make", metric, baseline_metric)
     corr_data = load_correlation_results(
-        model_a, model_b, dataset, metric, return_np=True, result_dir=result_dir)
+        model_a, model_b, dataset, baseline_metric, return_np=True, result_dir=result_dir)
     n_layers_m1, n_neurons_m1, n_layers_m2, n_neurons_m2 = corr_data.shape
     corr_data = flatten_layers(corr_data)
     if np.isnan(corr_data).any():

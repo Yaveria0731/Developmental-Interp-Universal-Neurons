@@ -47,15 +47,15 @@ class StreamingPearsonComputer:
                     batch_1_acts_l1, batch_2_acts[l2].to(
                         torch.float32), 'l1 t, l2 t -> l1 l2'
                 )
-                self.m1_m2_sum[l1, :, l2, :] += layerwise_result.cpu()
+                self.m1_m2_sum[l1, :, l2, :] += layerwise_result
 
         # batch_1_acts = batch_1_acts.to(self.device)
         # batch_2_acts = batch_2_acts.to(self.device)
 
-        self.m1_sum += batch_1_acts.sum(dim=-1).cpu()
-        self.m1_sum_sq += (batch_1_acts**2).sum(dim=-1).cpu()
-        self.m2_sum += batch_2_acts.sum(dim=-1).cpu()
-        self.m2_sum_sq += (batch_2_acts**2).sum(dim=-1).cpu()
+        self.m1_sum += batch_1_acts.sum(dim=-1)
+        self.m1_sum_sq += (batch_1_acts**2).sum(dim=-1)
+        self.m2_sum += batch_2_acts.sum(dim=-1)
+        self.m2_sum_sq += (batch_2_acts**2).sum(dim=-1)
 
         # TODO: reduce memory consumption (consider doing layerwise)
         # for large models may need to do disk caching
@@ -209,11 +209,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--batch_size', default=32, type=int)
     parser.add_argument(
-        '--model_1_device', type=str, default='cpu')
+        '--model_1_device', type=str, default='cuda')
     parser.add_argument(
-        '--model_2_device', type=str, default='cpu')
+        '--model_2_device', type=str, default='cuda')
     parser.add_argument(
-        '--correlation_device', type=str, default='cpu')
+        '--correlation_device', type=str, default='cuda')
 
     parser.add_argument(
         '--save_full_correlation_matrix', action='store_true',
